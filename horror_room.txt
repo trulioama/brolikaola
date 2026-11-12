@@ -271,6 +271,7 @@ end
 -- Task scheduler: choreography is written as coroutines that wait().
 ---------------------------------------------------------------------------
 local tasks = {}
+local inTask = false     -- true while a task coroutine is running (spawn helpers may only wait there)
 
 local function spawnTask(name, fn, onError)
     local t = { name = name, co = coroutine.create(fn), wake = 0, onError = onError }
@@ -294,6 +295,8 @@ local function after(delay, fn)
 end
 
 local function runTasks()
+    -- already close to the CPU quota: let this tick go by, every task simply resumes a little later
+    if cpuAverage() > cpuMax() * 0.75 then return end
     local i = 1
     while i <= #tasks do
         local t = tasks[i]
@@ -301,7 +304,9 @@ local function runTasks()
             table.remove(tasks, i)
         else
             if now >= t.wake then
+                inTask = true
                 local ok, delay = pcall(coroutine.resume, t.co)
+                inTask = false
                 if not ok then
                     t.dead = true
                     say("task '" .. t.name .. "' stopped: " .. tostring(delay))
@@ -564,11 +569,30 @@ local CYL    = "models/starfall/holograms/cylinder.mdl"
 
 local spawned = 0
 local skipped = 0
+local seenModel = {}
+local PIECES = 208      -- props + holograms in a full build, for the progress line
+local watchTotal = true
 
--- Called between spawns while building so the chip stays far below its CPU quota.
-local function breathe()
+-- StarfallEx stops a chip whose moving-average CPU time passes its quota, and that time includes
+-- the engine loading a model for the first time (tens of milliseconds each). So every spawn first
+-- waits until the average has room for it, and never adds work to a tick that is already long.
+-- The quota is shared by all of the owner's chips, hence the look at the total as well.
+local function govern(model)
+    if not inTask then return end
+    local room = seenModel[model] and 0.4 or 0.22
+    seenModel[model] = true
+    local max = cpuMax()
+    local giveUp = now + 6
+    while now < giveUp do
+        local busy = cpuAverage() > max * room or cpuUsed() > max
+        if not busy and not (watchTotal and cpuTotalAverage() > max * 0.6) then break end
+        coroutine.yield(0)
+    end
+    if now >= giveUp then watchTotal = false end    -- another chip is holding the budget; don't wait on it again
     spawned = spawned + 1
-    if spawned % 3 == 0 or cpuAverage() > cpuMax() * 0.3 then coroutine.yield(0) end
+    if spawned % 52 == 0 and spawned < PIECES then
+        say("building... " .. math.floor(spawned / PIECES * 100) .. "%")
+    end
 end
 
 -- Decor is tinted down with the room so nothing glows in the dark.
@@ -581,6 +605,7 @@ local function holoRaw(models, wpos, wang, scale)
     if isstring(models) then models = { models } end
     for _, m in ipairs(models) do
         if not hologram.canSpawn() then break end
+        govern(m)
         local ok, h = pcall(hologram.create, wpos, wang, m, scale)
         if ok and h then return h end
     end
@@ -652,6 +677,7 @@ local function propRaw(mdl, wpos, wang)
         if tries > 600 then return nil, "prop limit reached" end
         coroutine.yield(0.05)
     end
+    govern(mdl)
     local ok, ent = pcall(prop.create, wpos, wang, mdl, true)
     if not ok then return nil, tostring(ent) end
     pcall(ent.setDrawShadow, ent, false)
@@ -1019,7 +1045,6 @@ local function buildCast()
     E.escapee  = actor({ "models/zombie/fast.mdl", "models/zombie/classic.mdl" }, 1.0, Color(30, 26, 26))
     E.torso    = actor({ "models/zombie/classic_torso.mdl", "models/zombie/classic.mdl" }, 1.1, dim(225, 215, 205))
     E.warden   = actor({ "models/stalker.mdl", "models/zombie/poison.mdl" }, 1.4, Color(66, 54, 50))
-    breathe()
 
     E.mannequins = {}
     local homes = { { -60, 160, -90 }, { 70, -165, 90 }, { 160, -120, 180 }, { 0, 30, 200 }, { -150, 60, 0 } }
@@ -1029,7 +1054,6 @@ local function buildCast()
             a.home, a.homeYaw = P(3, hm[1], hm[2], 0), hm[3]
             E.mannequins[#E.mannequins + 1] = a
         end
-        breathe()
     end
 end
 
@@ -1043,13 +1067,11 @@ decor[1] = function()
     furn("models/props_c17/furnituretable001a.mdl", P(1, 40, -90, 0), 0)
     furn(CHAIR, P(1, 46, -138, 0), 90)
     furn("models/props_c17/furnituredrawer001a.mdl", P(1, 150, -110, 0), 180)
-    breathe()
     furn("models/props_c17/suitcase001a.mdl", P(1, -120, 60, 0), 25)
     furn("models/props_c17/briefcase001a.mdl", P(1, -96, 84, 0), -40)
     furn("models/props_junk/shoe001a.mdl", P(1, 10, 30, 0), 70)
     figure(CHAIR, P(1, 95, 40, 12), Angle(0, 40, 90), nil, dim(255, 255, 255))      -- knocked over
     furn("models/props_junk/wood_crate001a.mdl", P(1, -158, 150, 0), 12)
-    breathe()
     blood(P(1, -60, -120, 10))
     blood(P(1, 120, 100, 10))
     blood(P(1, 180, 0, 70), Vector(30, 0, 0))
@@ -1061,18 +1083,15 @@ decor[2] = function()
     box(P(2, 150, 60, 17), Vector(34, 64, 34), ANG0, dim(125, 98, 72), WOOD)
     E.tv = box(SPOT.tv, Vector(30, 40, 30), ANG0, dim(72, 68, 62))
     box(P(2, 134.9, 55, 49), Vector(0.3, 27, 27), ANG0, Color(3, 3, 3))
-    breathe()
     prim(CYL, P(2, 134.6, 74.5, 56), Vector(3.2, 3.2, 1.6), Angle(90, 0, 0), dim(180, 170, 150))
     prim(CYL, P(2, 134.6, 74.5, 46), Vector(3.2, 3.2, 1.6), Angle(90, 0, 0), dim(180, 170, 150))
     box(P(2, 150, 54, 76), Vector(0.6, 0.6, 28), Angle(0, 0, 24), dim(190, 190, 195))
     box(P(2, 150, 66, 76), Vector(0.6, 0.6, 28), Angle(0, 0, -24), dim(190, 190, 195))
-    breathe()
     box(P(2, -120, -130, 14), Vector(26, 26, 28), ANG0, dim(112, 86, 62), WOOD)
     E.radio = furn("models/props_lab/citizenradio.mdl", P(2, -120, -130, 28), 35)
     furn("models/props_c17/furniturearmchair001a.mdl", P(2, -40, -60, 0), 20)
     furn("models/props_c17/furnitureshelf001a.mdl", P(2, -60, 160, 0), -90)
     furn(CHAIR, P(2, 100, -120, 0), 140)
-    breathe()
     blood(P(2, 60, 20, 10))
 end
 
@@ -1080,11 +1099,9 @@ decor[3] = function()
     E.lever3 = makeLever(SPOT.lever, 180)
     furn("models/props_wasteland/prison_bedframe001b.mdl", P(3, -110, 150, 0), 0)
     furn("models/props_wasteland/prison_bedframe001b.mdl", P(3, 30, 150, 0), 0)
-    breathe()
     furn("models/props_c17/furnituremattress001a.mdl", P(3, -120, -150, 0), 15)
     furn("models/props_junk/metalbucket01a.mdl", P(3, 100, 120, 0), 0)
     furn("models/props_c17/furnitureradiator001a.mdl", P(3, -20, -176, 0), 90)
-    breathe()
     blood(P(3, -110, 140, 12))
     blood(P(3, 40, -20, 10))
 end
@@ -1097,7 +1114,6 @@ decor[4] = function()
     box(P(4, 60, 45.4, 35.5), Vector(13, 0.8, 8), Angle(0, 0, -18), dim(160, 62, 74))
     E.ballerina = figure("models/props_lab/huladoll.mdl", P(4, 60, 39, 32), ANG0, 1.2, dim(255, 255, 255))
     prim(CYL, P(4, 67.6, 40, 29), Vector(1.2, 1.2, 5), Angle(90, 0, 0), dim(210, 190, 90))
-    breathe()
     box(P(4, 178, -20, 45), Vector(18, 112, 2), ANG0, dim(112, 86, 62), WOOD)          -- shelf
     E.carousel = furn("models/props_c17/playground_carousel01.mdl", P(4, -110, -110, 0), 0, 0.55)
     if E.carousel then pcall(E.carousel.setAngVel, E.carousel, Angle(0, 9, 0)) end
@@ -1105,7 +1121,6 @@ decor[4] = function()
     box(P(4, -20, -60, 5), Vector(10, 10, 10), Angle(0, 20, 0), dim(200, 60, 60))
     box(P(4, -6, -52, 5), Vector(10, 10, 10), Angle(0, -35, 0), dim(60, 90, 200))
     box(P(4, -14, -56, 15), Vector(10, 10, 10), Angle(0, 50, 0), dim(210, 190, 60))
-    breathe()
 
     E.dolls = {}
     local homes = {
@@ -1116,7 +1131,6 @@ decor[4] = function()
         local home, ang = P(4, hm[1], hm[2], hm[3]), Angle(0, hm[4], 0)
         local h = figure("models/props_c17/doll01.mdl", home, ang, 1.25, dim(255, 236, 226))
         if h then E.dolls[#E.dolls + 1] = { h = h, home = home, ang = ang } end
-        breathe()
     end
 end
 
@@ -1134,14 +1148,12 @@ decor[5] = function()
             prim(CYL, P(5, g[1], g[2], 0.3), Vector(30 + math.random(0, 12), 30 + math.random(0, 12), 0.5), ANG0, Color(46, 2, 2))
         end
         blood(P(5, g[1] + math.random(-12, 12), g[2] + math.random(-12, 12), 10))
-        breathe()
     end
     box(P(5, -120, 150, 17), Vector(70, 36, 34), ANG0, dim(160, 160, 165), CONFIG.MAT.partition)   -- cutting table
     furn("models/props_lab/cleaver.mdl", P(5, -132, 150, 34), 30)
     furn("models/props_junk/meathook001a.mdl", P(5, -100, 146, 34), 80)
     furn("models/props_junk/metalbucket01a.mdl", P(5, -70, 118, 0), 0)
     solidFurn("models/props_c17/furniturefridge001a.mdl", P(5, 158, 150, 0), -90)
-    breathe()
     blood(P(5, -120, 150, 40))
     blood(P(5, -150, 100, 10))
 end
@@ -1163,20 +1175,17 @@ decor[6] = function()
         local j = (i + 1) % 5 + 1
         local a, b = CANDLES[i], CANDLES[j]
         box((a + b) * 0.5 + Vector(0, 0, 0.25), Vector(a:getDistance(b), 2.2, 0.4), Angle(0, yawTo(a, b), 0), Color(74, 5, 5))
-        breathe()
     end
     for i = 0, 2 do
         local a = math.rad(40 + i * 120)
         local p = SPOT.circle + Vector(math.cos(a) * 138, math.sin(a) * 138, 0)
         furn(CHAIR, clampInto(6, p, 26), yawTo(p, SPOT.circle))
     end
-    breathe()
     E.altar = box(P(6, 165, -60, 18), Vector(30, 70, 36), ANG0, dim(96, 74, 58), WOOD)
     figure("models/gibs/hgibs.mdl", P(6, 162, -44, 40), Angle(0, 180, 0), 1.1, dim(235, 228, 208))
     box(P(6, 160, -74, 37.5), Vector(12, 16, 3), Angle(0, 12, 0), dim(70, 20, 20))                 -- book
     box(P(6, 186, -60, 118), Vector(2, 5, 56), ANG0, dim(80, 60, 45), WOOD)                        -- inverted cross
     box(P(6, 186, -60, 101), Vector(2, 30, 5), ANG0, dim(80, 60, 45), WOOD)
-    breathe()
     blood(SPOT.circle + Vector(0, 0, 10))
 end
 
@@ -1187,26 +1196,22 @@ decor[7] = function()
         if i == 2 then ang = Angle(0, 0, 24) elseif i == 3 then ang = Angle(0, 0, -19) end   -- forced apart
         local b = box(P(7, -95 + i * 19, 10, H / 2), Vector(2.2, 2.2, H), ang, barC, CONFIG.MAT.partition)
         if i == 8 then E.cellAnchor = b end
-        if i % 4 == 3 then breathe() end
     end
     box(P(7, 47.5, 10, 36), Vector(285, 3, 2.2), ANG0, barC, CONFIG.MAT.partition)
     box(P(7, 47.5, 10, 150), Vector(285, 3, 2.2), ANG0, barC, CONFIG.MAT.partition)
     local wallC = shadeCol(205, 200, 190)
     box(P(7, 95, 100, H / 2), Vector(2.5, 180, H), ANG0, wallC, CONFIG.MAT.partition)
     box(P(7, 0, 100, H / 2), Vector(2.5, 180, H), ANG0, wallC, CONFIG.MAT.partition)
-    breathe()
     furn("models/props_wasteland/prison_toilet01.mdl", P(7, 172, 168, 0), -90)
     furn("models/props_wasteland/prison_bedframe001b.mdl", P(7, 62, 150, 0), 0)
     furn("models/props_wasteland/prison_bedframe001b.mdl", P(7, -50, 150, 0), 0)
     furn("models/props_c17/doll01.mdl", P(7, -30, 60, 0), 40, 1.2)
-    breathe()
     -- a trail from the empty cell to the way out
     local trail = { { -62, 40 }, { -84, 2 }, { -118, -18 }, { -146, 30 }, { -158, 96 } }
     for _, t in ipairs(trail) do
         prim(CYL, P(7, t[1], t[2], 0.3), Vector(20 + math.random(0, 10), 16 + math.random(0, 8), 0.5), Angle(0, math.random(0, 180), 0), Color(46, 2, 2))
         blood(P(7, t[1], t[2], 10))
     end
-    breathe()
 end
 
 decor[8] = function()
@@ -1222,15 +1227,12 @@ decor[8] = function()
     end
     furn("models/props_c17/furnituretoilet001a.mdl", P(8, -150, 150, 0), -45)
     furn("models/props_c17/furnituresink001a.mdl", P(8, -60, 168, 0), -90)
-    breathe()
     furn("models/props_c17/furniturewashingmachine001a.mdl", P(8, 150, -150, 0), 180)
     furn("models/props_c17/furnitureradiator001a.mdl", P(8, 60, -176, 0), 90)
     furn("models/props_junk/metalbucket01a.mdl", P(8, 62, 40, 0), 0)
-    breathe()
     local pipeC = dim(130, 96, 74)
     prim(CYL, P(8, 0, 120, H - 16), Vector(7, 7, CELL - 4), Angle(90, 0, 0), pipeC, CONFIG.MAT.wall)
     prim(CYL, P(8, -110, 0, H - 26), Vector(5, 5, CELL - 4), Angle(90, 90, 0), pipeC, CONFIG.MAT.wall)
-    breathe()
     for i = 1, 6 do
         blood(P(8, math.random(-150, 150), math.random(-150, 150), 10))
     end
@@ -1241,11 +1243,9 @@ decor[9] = function()
     solidFurn("models/props_c17/lockers001a.mdl", P(9, 80, 160, 0), -90)
     furn("models/props_c17/furnituretable002a.mdl", P(9, 60, -20, 0), 15)
     figure(CHAIR, P(9, 20, 10, 12), Angle(0, 70, 90), nil, dim(255, 255, 255))
-    breathe()
     furn("models/props_wasteland/controlroom_filecabinet002a.mdl", P(9, 165, 60, 0), 180)
     furn("models/props_wasteland/controlroom_storagecloset001a.mdl", P(9, 165, 150, 0), 180)
     furn(CHAIR, P(9, 92, -52, 0), 250)
-    breathe()
     blood(P(9, -60, -60, 10))
 end
 
@@ -1253,12 +1253,10 @@ decor[10] = function()
     furn("models/props_junk/wood_crate001a.mdl", P(10, 150, -160, 0), 30)
     furn("models/props_c17/oildrum001.mdl", P(10, 168, 60, 0), 0)
     furn("models/props_junk/cinderblock01a.mdl", P(10, 20, 120, 0), 60)
-    breathe()
     figure(CHAIR, P(10, -20, -60, 12), Angle(0, 15, 90), nil, dim(255, 255, 255))
     furn("models/props_junk/wood_pallet001a.mdl", P(10, -150, -150, 0), 20)
     E.exitSign = box(Vector(4, G[10].y, H - 24), Vector(2, 42, 13), ANG0, Color(40, 255, 100))
     glow(E.exitSign)
-    breathe()
     blood(P(10, 120, -40, 10))
     blood(P(10, -120, 60, 10))
 end
@@ -1269,6 +1267,7 @@ local function buildTerminal()
     local tries = 0
     while not prop.canSpawn() and tries < 100 do tries = tries + 1 coroutine.yield(0.05) end
     local wp, wa = toWorld(Vector(-46, 0, 44), Angle(0, 180, 0))
+    govern("models/bull/dynamicbuttonsf.mdl")
     local ok, hud = pcall(prop.createComponent, wp, wa, "starfall_hud", "models/bull/dynamicbuttonsf.mdl", true)
     if ok and hud then
         E.hud = hud
@@ -2447,6 +2446,12 @@ local SPHERE = "models/starfall/holograms/sphere.mdl"
 local me = player()
 local now = timer.curtime()
 local synced, inited = false, false
+
+-- Start-up work is spread over many frames: the client CPU quota is a moving average as well, and
+-- creating every hologram, render target, font and sound in one frame could trip it.
+local startup = {}
+local function stage(name, fn) startup[#startup + 1] = { name, fn } end
+
 local myPos, myK = Vector(0, 0, 0), 0
 local inside = 0                 -- 0..1, eased: how far "in the ward" the local player is
 local tension, tensionShown = 0, 0
@@ -2578,17 +2583,21 @@ local function initLamps()
         local f = { phase = math.random(0, 40), wpos = toWorld(L.pos), v = -1, bv = -1 }
         lampFx[id] = f
         if id <= 10 then
-            local ok, h = pcall(hologram.create, f.wpos, Angle(), SPHERE, Vector(7, 7, 7))
-            if ok and h then
-                f.bulb = h
-                pcall(h.setMaterial, h, "debug/debugdrawflat")
-                pcall(h.suppressEngineLighting, h, true)
-                h:setColor(Color(0, 0, 0))
-            end
+            stage("bulbs", function()
+                local ok, h = pcall(hologram.create, f.wpos, Angle(), SPHERE, Vector(7, 7, 7))
+                if ok and h then
+                    f.bulb = h
+                    pcall(h.setMaterial, h, "debug/debugdrawflat")
+                    pcall(h.suppressEngineLighting, h, true)
+                    h:setColor(Color(0, 0, 0))
+                end
+            end)
             -- the cord it hangs from
-            local cp = toWorld(L.pos + Vector(0, 0, 9))
-            local ok2, c = pcall(hologram.create, cp, Angle(), BOX, Vector(0.7, 0.7, 11))
-            if ok2 and c then c:setColor(Color(12, 12, 12)) end
+            stage("bulbs", function()
+                local cp = toWorld(L.pos + Vector(0, 0, 9))
+                local ok, c = pcall(hologram.create, cp, Angle(), BOX, Vector(0.7, 0.7, 11))
+                if ok and c then c:setColor(Color(12, 12, 12)) end
+            end)
         end
     end
 end
@@ -2688,19 +2697,21 @@ local function initText()
         h:setNoDraw(true)
         return h
     end
-    text.write  = panel("ward13_write", 160)
-    text.prompt = panel("ward13_prompt", 60)
-    text.tv     = panel("ward13_tv", 26)
-    text.fWrite  = render.createFont("Akbar", 170, 700, true)
-    text.fWriteS = render.createFont("Akbar", 118, 700, true)
-    text.fKey    = render.createFont("Roboto", 120, 900, true)
-    text.fLabel  = render.createFont("Roboto", 70, 700, true)
-    text.fTV     = render.createFont("Roboto", 150, 900, true)
-    local wp, wa = toWorld(SPOT.tvScreen, Angle(0, 180, 0))
-    text.tv:setPos(wp)
-    text.tv:setAngles(wa)
-    text.tv:setNoDraw(false)
-    text.ok = true
+    stage("text", function() text.write = panel("ward13_write", 160) end)
+    stage("text", function() text.prompt = panel("ward13_prompt", 60) end)
+    stage("text", function() text.tv = panel("ward13_tv", 26) end)
+    stage("text", function()
+        text.fWrite  = render.createFont("Akbar", 170, 700, true)
+        text.fWriteS = render.createFont("Akbar", 118, 700, true)
+        text.fKey    = render.createFont("Roboto", 120, 900, true)
+        text.fLabel  = render.createFont("Roboto", 70, 700, true)
+        text.fTV     = render.createFont("Roboto", 150, 900, true)
+        local wp, wa = toWorld(SPOT.tvScreen, Angle(0, 180, 0))
+        text.tv:setPos(wp)
+        text.tv:setAngles(wa)
+        text.tv:setNoDraw(false)
+        text.ok = true
+    end)
 end
 
 local function drawWriting(w, seed)
@@ -2909,10 +2920,14 @@ end
 local amb = { at = 0 }
 
 local function initSounds()
-    local ok, s = pcall(sound.create, me, "ambient/atmosphere/drone4lp.wav")
-    if ok and s then amb.bed = s end
-    local ok2, s2 = pcall(sound.create, me, "player/heartbeat1.wav")
-    if ok2 and s2 then amb.heart = s2 end
+    stage("sounds", function()
+        local ok, s = pcall(sound.create, me, "ambient/atmosphere/drone4lp.wav")
+        if ok and s then amb.bed = s end
+    end)
+    stage("sounds", function()
+        local ok, s = pcall(sound.create, me, "player/heartbeat1.wav")
+        if ok and s then amb.heart = s end
+    end)
 end
 
 local function fade(s, key, want, vol, pitch)
@@ -2989,7 +3004,7 @@ hook.add("drawhud", "ward13_hud", function()
             local pulse = (math.sin(now * (4 + tensionShown * 5)) * 0.5 + 0.5) * (tensionShown - 0.5) * 2
             vignette(w, h, Color(120, 0, 0, 110 * pulse * a), 0.2)
         end
-        if CONFIG.FILM_GRAIN then
+        if CONFIG.FILM_GRAIN and cpuAverage() < cpuMax() * 0.6 then
             for i = 1, 44 do
                 local g = math.random(0, 1) * 255
                 render.setColor(Color(g, g, g, math.random(6, 22) * a))
@@ -3093,8 +3108,14 @@ hook.add("think", "ward13_client", function()
         guard("lamps", initLamps)
         guard("text", initText)
         guard("sounds", initSounds)
-        guard("hud", initHud)
-        tryHud()
+        stage("hud", initHud)
+        stage("hud", tryHud)
+    end
+    -- one start-up step per frame, and only while the chip is well inside its CPU quota
+    local load = cpuAverage() / cpuMax()
+    if startup[1] and load < 0.3 then
+        local s = table.remove(startup, 1)
+        guard(s[1], s[2])
     end
 
     myPos = toLocal(me:getPos())
@@ -3102,9 +3123,11 @@ hook.add("think", "ward13_client", function()
     inside = inside + clamp((myK > 0 and 1 or 0) - inside, -ft * 1.2, ft * 1.6)
     tensionShown = tensionShown + clamp(tension - tensionShown, -ft * 0.5, ft * 1.5)
 
+    guard("scare", updateScare)
+    -- close to the quota: skip a frame of upkeep rather than risk the chip (lights hold their last state)
+    if load > 0.8 then return end
     guard("lamps", updateLamps)
     guard("text", updateText, ft)
-    guard("scare", updateScare)
     guard("sounds", updateSounds)
     guard("fog", updateFog)
 end)

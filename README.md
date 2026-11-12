@@ -18,7 +18,8 @@ material is stock Garry's Mod / Half-Life 2 content.
 - Stand on **flat, open ground** with about **2000 × 800 units** free in front of you
   (`gm_flatgrass` is ideal) and place the chip at your feet.
 - The ward is built *away from you*, starting a little past the chip. Building takes
-  roughly 12 seconds (props are rate limited); the chip tells you in chat when it is ready.
+  about 15–40 seconds the first time on a map (every model has to load, and the chip paces
+  itself to stay inside StarfallEx's CPU quota). Progress and "ready" are printed in chat.
 - Enter through the **left** door. The exit is the right door, ten rooms later.
 
 Budget: about 46 props and 161 holograms (of StarfallEx's default 200). If your hologram
@@ -85,6 +86,9 @@ change `AMBIENT` first, then `LAMP_BRIGHTNESS`.
 
 ## Troubleshooting
 
+- **"CPU usage exceeded"** — the chip waits for its CPU average to drop before every
+  spawn, so this should not happen from building. If you run other heavy chips at the same
+  time they share your quota (`sf_timebuffer`); remove them or raise the quota.
 - **"build failed"** — the server refused a prop (usually `sbox_maxprops`). Free some up
   and place the chip again.
 - **"N decorations were skipped"** — you were near the hologram limit
