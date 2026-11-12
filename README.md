@@ -1,3 +1,14 @@
+# StarfallEx chips
+
+| Chip | What it is |
+|------|------------|
+| [`horror_room.txt`](horror_room.txt) | **WARD 13** — a ten-room, walk-through horror house |
+| [`apocalypse.txt`](apocalypse.txt) | **APOCALYPSE** — a slow, map-wide storm with a face in the sky and a tornado ([jump to it](#apocalypse--the-face-in-the-storm)) |
+
+Both need [StarfallEx](https://github.com/thegrb93/StarfallEx) only and use stock Garry's Mod /
+Half-Life 2 content. Copy the file into `garrysmod/data/starfall/`, open it in the Starfall
+editor and place the chip with the Starfall processor tool.
+
 # WARD 13 — a StarfallEx horror room
 
 A single StarfallEx chip that builds a ten-room, walk-through horror house and runs it:
@@ -97,3 +108,92 @@ change `AMBIENT` first, then `LAMP_BRIGHTNESS`.
   holograms or materials for other people's chips in their Starfall permission settings.
   The rest keeps working.
 - **Ground warning in chat** — the area ahead is not level; move to flatter ground.
+
+# APOCALYPSE — the face in the storm
+
+One chip that ends the world slowly, on whatever map you are on. Place it anywhere under open
+sky and type `!apoc start` (or press USE on it).
+
+## What happens
+
+| Time | Stage | What you see and hear |
+|------|-------|-----------------------|
+| 0:00 | Dusk | The sky sinks to a deep navy. Three cloud decks arrive from one horizon, band by band, sink into place and begin to turn around the zenith. Wind rises |
+| 0:45 | Storm | Sheet lightning low on the horizon with thunder seconds later, then nearer and louder; forked bolts hit the ground, sometimes close to a player. Rain from 1:35 |
+| 2:30 | The face | A glow gathers behind the clouds, then an enormous head pushes forward through the deck, nose and brow first. It blinks, its eyes dart ahead of its head, it looks around the map, picks a player and stares without blinking, and from 3:28 it laughs |
+| 3:56 | The tornado | It draws breath, purses its lips and blows a column of vapour at the map. Where that lands, a wall cloud lowers, dust starts to turn on the ground, and a funnel comes down to meet it. It then wanders the map, leaning into its own movement, and grows; every further breath feeds it and shoves it downwind |
+
+After that it runs until you stop it: lightning, new looks, stares, laughs and breaths are
+decided as it goes, so no two runs are the same. `!apoc stop` lets the funnel rope out, the face
+sink back and the sky clear over 30 seconds, then removes everything.
+
+## Commands (chip owner)
+
+| Command | Effect |
+|---------|--------|
+| `!apoc start` | Begin (USE on the chip does the same while idle) |
+| `!apoc stop` | Clear the storm gracefully, then clean up |
+| `!apoc reset` | Remove everything immediately |
+| `!apoc status` | Stage, elapsed time, tornado strength |
+| `!apoc skip` | Jump to the next stage |
+| `!apoc laugh` / `!apoc blow` | Make the face do it now (once it is out) |
+
+## Who sees what
+
+Everyone, with no setup: sky, clouds, lightning, the face, the tornado, rain, and all sound. It is
+built from clientside holograms, custom meshes and particles, so it needs no HUD permission and
+puts no entities on the server. Timing, lightning, the face's behaviour and the tornado's path
+come from the server, so all players see the same event.
+
+With the Starfall HUD you also get camera shake (thunder, laughter, the tornado nearby) and a
+screen flash on lightning. The owner gets this automatically; other players press USE on the
+chip and accept the request.
+
+## Tuning
+
+`CONFIG` at the top of the script:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `TIME_SCALE` | `1.0` | `2` runs the build-up twice as fast |
+| `DARKNESS` | `0.68` | How dark the world gets (0 – 0.85). The sky keeps its look whatever you set |
+| `SKY_DISTANCE` | `9000` | Radius of the storm sky around each player. Lower it on maps that clip distant geometry |
+| `FACE_SIZE` | `1.0` | Size of the head |
+| `FACE_MODEL` | `models/gman_high.mdl` | Any character model with an `eyes` attachment and the standard face flexes |
+| `EYE_TRACKING` | `true` | Eye movement independent of the head |
+| `QUALITY` | `1.0` | Cloud, funnel and debris density (0.5 – 1.5) |
+| `RAIN` | `true` | Rain particles and rain sound |
+| `TORNADO_PHYSICS` | `true` | The tornado throws the physics props this chip may touch (normally the owner's) |
+| `HUD_EFFECTS` | `true` | Camera shake and screen flash for HUD players |
+| `VOLUME` | `1.0` | Master volume |
+| `END_TIME` | `30` | Seconds `stop` takes to clear the sky |
+| `AUTO_START` | `false` | Start as soon as the chip is placed |
+| `ADMINS_CAN_CONTROL` | `false` | Let server admins use the commands too |
+
+Budget per player: 61 holograms (of 200), 20 materials (of 40), 17 sounds (of 20), 3 particle
+emitters. If another of your chips already uses most of a budget, the pieces that do not fit
+are skipped and the rest still runs.
+
+## How it works, and what that means
+
+- **The sky belongs to each player.** Dome, clouds and face are placed around your own eyes
+  like a skybox, so they are the same size and in the same compass direction for everyone,
+  wherever they stand. The tornado, ground strikes and debris are at real places on the map.
+- **The world is darkened by a tint, not relit.** Starfall cannot change a map's baked lighting,
+  so the ground gets darker and bluer but shadows stay where the map put them.
+- **The face is a real character head** with its flex controllers driven every frame, which is
+  what gives it blinking, eye darts and lip shapes. When StarfallEx's `bass` library can read
+  the laugh sound, the jaw follows its measured loudness; otherwise it follows the laugh's rhythm.
+- **Maps with heavy fog or a short far clip plane** hide distant things, including this. If the
+  sky or the face is cut off, lower `SKY_DISTANCE`.
+- **Indoor-only maps** have no sky to show it in. The chip tells you if it found none.
+
+## Troubleshooting
+
+- **"X switched off: …" in chat** — one part hit an error and disabled itself; the rest keeps
+  running. `!apoc reset` then `!apoc start` rebuilds everything. Please report the message.
+- **"CPU usage exceeded"** — building is spread over frames and the chip skips work when its
+  average is high, but other heavy chips share your quota. Lower `QUALITY`.
+- **One player sees or hears nothing** — they have blocked holograms, materials, meshes or
+  sounds for other people's chips in their Starfall permission settings.
+- **The eyes look wrong with a custom `FACE_MODEL`** — set `EYE_TRACKING = false`.
