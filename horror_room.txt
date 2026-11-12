@@ -1,0 +1,3112 @@
+--@name WARD 13 - Horror Room
+--@author Hoplite
+--@shared
+
+--[[
+    WARD 13 - a ten-chamber, walk-through horror room for StarfallEx.
+
+    Place the chip on flat, open ground (roughly 2000 x 800 units of free space).
+    The ward is built in front of you, away from where you stand. Walk in through
+    the left door; the way out is the right door, ten rooms later.
+
+    Chambers / events
+       1  Admissions   - the door slams, the lights die, something whispers
+       2  Day Room     - silence the radio, switch off the TV, then turn around
+       3  Burn Ward    - they only move when nobody is looking; pull the lever
+       4  Nursery      - wind the music box and wait for the lullaby to end
+       5  Cold Storage - throw the breaker between the hanging bodies
+       6  Chapel       - light the five candles
+       7  Isolation    - walk the cell block; one of them got out
+       8  Hydrotherapy - the key is at the bottom of the tub (hold USE)
+       9  Staff Room   - hide in the nook, stand still, flashlight off
+      10  The Way Out  - run
+
+    Everyone sees the rooms, lights, monsters and hears the sounds. Screen effects
+    (darkening, fog, grain, camera shake, subtitles) need the Starfall HUD: the
+    owner gets it automatically, other players press USE on the terminal by the
+    entrance (or USE the chip and accept the permission request).
+
+    Owner chat commands:  !ward reset   !ward open   !ward status
+]]
+
+local CONFIG = {
+    AMBIENT         = 0.32,  -- interior surface brightness: 0 = pitch black, 1 = unshaded
+    HUD_DARKNESS    = 0.26,  -- extra screen darkening for HUD players (0..1)
+    LAMP_BRIGHTNESS = 1.0,   -- multiplier for every lamp in the ward
+    LAMP_SHADOWS    = true,  -- the lamp of the room you are in casts real shadows
+    FOG             = true,  -- distance fog for HUD players
+    FILM_GRAIN      = true,
+    VOLUME          = 1.0,   -- 0..1
+    OWNER_AUTO_HUD  = true,
+    SNAP_YAW        = 90,    -- snap the building to this many degrees (0 = free)
+    FRONT_OFFSET    = 150,   -- distance from the chip to the front wall
+    RESET_DELAY     = 40,    -- seconds after the finale before the ward re-arms
+    IDLE_RESET      = 120,   -- re-arm when a run is abandoned for this long
+    FAILSAFE        = 150,   -- a stuck room opens by itself after this many seconds
+    CHAT_PREFIX     = "!ward",
+    MAT = {
+        floor     = "models/props_wasteland/wood_fence01a",
+        wall      = "models/props_pipes/GutterMetal01a",
+        ceiling   = "models/props_pipes/GutterMetal01a",
+        partition = "models/props_c17/FurnitureMetal001a",
+        door      = "phoenix_storms/metalset_1-2",
+    },
+}
+
+---------------------------------------------------------------------------
+-- Shared layout
+---------------------------------------------------------------------------
+-- Room-local space: +X runs away from the entrance, +Y is left, +Z is up.
+-- Chambers 1-5 run down the left row (+Y), 6-10 come back along the right row.
+
+local U    = 47.45       -- PHX plate unit
+local CELL = U * 8       -- chamber edge
+local H    = U * 4       -- ceiling height
+local LEN  = CELL * 5
+
+local VEC0, ANG0 = Vector(0, 0, 0), Angle(0, 0, 0)
+local ORIGIN, BASE       -- world frame of the ward, decided by the server
+
+local function clamp(v, a, b) if v < a then return a elseif v > b then return b end return v end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function pick(t) return t[math.random(1, #t)] end
+
+local function toWorld(lp, la) return localToWorld(lp, la or ANG0, ORIGIN, BASE) end
+local function toLocal(wp) return (worldToLocal(wp, ANG0, ORIGIN, BASE)) end
+local function dirToWorld(d) return (localToWorld(d, ANG0, VEC0, BASE)) end
+local function dirToLocal(d) return (worldToLocal(d, ANG0, VEC0, BASE)) end
+
+local function chamberCenter(k)
+    local col = k <= 5 and k or 11 - k
+    return (col - 0.5) * CELL, (k <= 5 and 0.5 or -0.5) * CELL
+end
+
+-- Point in chamber k, given as an offset from the centre of its floor.
+local function P(k, dx, dy, z)
+    local cx, cy = chamberCenter(k)
+    return Vector(cx + dx, cy + dy, z or 0)
+end
+
+local function chamberAt(lp)
+    if lp.z < -30 or lp.z > H + 30 then return 0 end
+    if lp.x < 0 or lp.x >= LEN or lp.y <= -CELL or lp.y >= CELL then return 0 end
+    local col = math.floor(lp.x / CELL) + 1
+    if lp.y >= 0 then return col end
+    return 11 - col
+end
+
+-- Doorways. G[0] is the entrance, G[k] leads out of chamber k, G[10] is the exit.
+local G = {
+    [0]  = { kind = "wallx", x = 0,      y = 4 * U },
+    [1]  = { kind = "wallx", x = 8 * U,  y = 7 * U },
+    [2]  = { kind = "wallx", x = 16 * U, y = 1 * U },
+    [3]  = { kind = "wallx", x = 24 * U, y = 7 * U },
+    [4]  = { kind = "wallx", x = 32 * U, y = 1 * U },
+    [5]  = { kind = "wally", x = 39 * U, y = 0 },
+    [6]  = { kind = "wallx", x = 32 * U, y = -7 * U },
+    [7]  = { kind = "wallx", x = 24 * U, y = -1 * U },
+    [8]  = { kind = "wallx", x = 16 * U, y = -7 * U },
+    [9]  = { kind = "wallx", x = 8 * U,  y = -1 * U },
+    [10] = { kind = "wallx", x = 0,      y = -4 * U },
+}
+local function gapPos(i, z) return Vector(G[i].x, G[i].y, z or 0) end
+
+-- Fixed places both realms need to agree on.
+local SPOT = {
+    radio    = P(2, -120, -130, 30),
+    tv       = P(2, 150, 60, 49),
+    tvScreen = P(2, 134.5, 55, 49),
+    lever    = P(3, 185, 40, 62),
+    musicbox = P(4, 60, 40, 30),
+    breaker  = P(5, 60, 185, 62),
+    circle   = P(6, -10, -10, 0),
+    tub      = P(8, 0, -20, 0),
+    nook     = P(9, -145, -143, 0),
+}
+
+local CANDLES = {}
+for i = 1, 5 do
+    local a = math.rad(90 + 72 * (i - 1))
+    CANDLES[i] = SPOT.circle + Vector(math.cos(a) * 80, math.sin(a) * 80, 0)
+end
+
+-- Lamp modes are Half-Life style brightness strings sampled at 10 Hz ('a' = off, 'm' = normal).
+local MODE = { OFF = 0, STEADY = 1, FLICKER = 2, STROBE = 3, DYING = 4, PULSE = 5, BUZZ = 6, CANDLE = 7, ALARM = 8 }
+local PATTERN = {
+    [1] = "m",
+    [2] = "mmmmammmmmmaammmmmmmmmmamammmmmmmmmmmaaammmmmmmlmmmmm",
+    [3] = "ma",
+    [4] = "aaaaaaaaaaaaamaaaaaaaaaaaaaaaaaaammaaaaaaaaaaaaaaaaaaaaaaa",
+    [5] = "ghijklmnopqrrqponmlkjihg",
+    [6] = "mmmmmmlmmmmmmmmkmmmmmmmmmmmmammmmmmmmmmlmmmm",
+    [7] = "mmmlmmnmmlkmmnmmmlmmonmmlmmmkmmn",
+    [8] = "mmmmmmaaaaaa",
+}
+local SMOOTH = { [5] = true, [7] = true }
+
+-- 1-10: ceiling lamps (projected light). 11+: small accent lights.
+local LAMPS = {}
+for k = 1, 10 do
+    LAMPS[k] = { pos = P(k, 0, 0, H - 14), chamber = k, proj = true, fov = 128, far = 520, size = 250 }
+end
+LAMPS[7].pos = P(7, 40, -90, H - 14)
+LAMPS[11] = { pos = P(2, 118, 55, 49), chamber = 2, size = 190 }                 -- TV glow
+for i = 1, 5 do
+    LAMPS[11 + i] = { pos = CANDLES[i] + Vector(0, 0, 16), chamber = 6, size = 120 }
+end
+LAMPS[17] = { pos = P(10, 0, 0, H - 40), chamber = 10, proj = true, fov = 75, far = 620, size = 200, spin = 220 }
+LAMPS[18] = { pos = Vector(14, -4 * U, H - 26), chamber = 10, size = 110 }       -- exit sign
+
+local LAMP_DEFAULT = {
+    [1]  = { MODE.FLICKER, 255, 214, 170, 1.00 },
+    [2]  = { MODE.BUZZ,    200, 235, 190, 0.90 },
+    [3]  = { MODE.STEADY,  190, 210, 255, 1.00 },
+    [4]  = { MODE.STEADY,  255, 190, 150, 0.80 },
+    [5]  = { MODE.BUZZ,    170, 225, 255, 0.90 },
+    [6]  = { MODE.STEADY,  150, 110, 220, 0.40 },
+    [7]  = { MODE.FLICKER, 215, 220, 150, 0.85 },
+    [8]  = { MODE.BUZZ,    185, 255, 205, 0.90 },
+    [9]  = { MODE.FLICKER, 255, 205, 130, 0.85 },
+    [10] = { MODE.STEADY,  255, 90,  70,  0.55 },
+    [11] = { MODE.OFF,     170, 200, 255, 1.00 },
+    [17] = { MODE.OFF,     255, 30,  20,  1.60 },
+    [18] = { MODE.STEADY,  60,  255, 110, 0.70 },
+}
+for i = 12, 16 do LAMP_DEFAULT[i] = { MODE.OFF, 255, 150, 60, 1.0 } end
+
+-- Things players can press USE on.
+local INT = { RADIO = 1, TV = 2, LEVER = 3, MUSICBOX = 4, BREAKER = 5, CANDLE = 6, TUB = 11 }
+local INTERACT = {
+    [1]  = { pos = SPOT.radio,                     label = "SILENCE THE RADIO",    radius = 85 },
+    [2]  = { pos = SPOT.tv,                        label = "SWITCH OFF THE TV",    radius = 95 },
+    [3]  = { pos = SPOT.lever,                     label = "PULL THE LEVER",       radius = 85 },
+    [4]  = { pos = SPOT.musicbox,                  label = "WIND THE MUSIC BOX",   radius = 85 },
+    [5]  = { pos = SPOT.breaker,                   label = "THROW THE BREAKER",    radius = 85 },
+    [11] = { pos = SPOT.tub + Vector(0, 0, 26),    label = "REACH INTO THE WATER", radius = 80, hold = 3.6 },
+}
+for i = 1, 5 do
+    INTERACT[5 + i] = { pos = CANDLES[i] + Vector(0, 0, 12), label = "LIGHT THE CANDLE", radius = 70 }
+end
+
+-- Writing on the walls; index = chamber the reader stands in (0 = outside).
+local WRITINGS = {
+    [0]  = { pos = Vector(-2.5, 4 * U, 150), yaw = 180, size = 150, lines = { "WARD 13" },               col = { 200, 190, 170 } },
+    [1]  = { pos = P(1, 187, -40, 105),      yaw = 180, size = 170, lines = { "NO ONE", "LEAVES" },      col = { 150, 8, 8 } },
+    [2]  = { pos = P(2, 60, 187, 110),       yaw = -90, size = 170, lines = { "DON'T", "TURN IT OFF" },  col = { 150, 8, 8 } },
+    [3]  = { pos = P(3, 40, 187, 110),       yaw = -90, size = 170, lines = { "DON'T", "LOOK AWAY" },    col = { 150, 8, 8 } },
+    [4]  = { pos = P(4, -20, -187, 100),     yaw = 90,  size = 160, lines = { "PLAY", "WITH US" },       col = { 170, 20, 60 } },
+    [5]  = { pos = P(5, 187, 40, 110),       yaw = 180, size = 170, lines = { "HE NEVER", "STOPS", "CUTTING" }, col = { 150, 8, 8 } },
+    [6]  = { pos = P(6, 30, -187, 110),      yaw = 90,  size = 170, lines = { "FIVE FLAMES", "WAKE IT" }, col = { 150, 8, 8 } },
+    [7]  = { pos = P(7, 40, -187, 110),      yaw = 90,  size = 170, lines = { "ONE", "GOT OUT" },        col = { 150, 8, 8 } },
+    [8]  = { pos = P(8, -40, 187, 110),      yaw = -90, size = 170, lines = { "IT'S IN", "THE WATER" },  col = { 150, 8, 8 } },
+    [9]  = { pos = P(9, -20, -187, 110),     yaw = 90,  size = 160, lines = { "HIDE --->", "BE STILL", "NO LIGHT" }, col = { 150, 8, 8 } },
+    [10] = { pos = P(10, 65.5, 60, 105),     yaw = 0,   size = 170, lines = { "RUN" },                   col = { 190, 10, 10 } },
+}
+
+-- Models used for the in-your-face scare, with the rough position of the face in model space.
+local SCARE = {
+    [1] = { model = "models/zombie/classic.mdl",       head = Vector(11, 0, 55) },
+    [2] = { model = "models/humans/charple01.mdl",     head = Vector(3, 0, 66) },
+    [3] = { model = "models/zombie/fast.mdl",          head = Vector(15, 0, 48) },
+    [4] = { model = "models/stalker.mdl",              head = Vector(4, 0, 62) },
+    [5] = { model = "models/zombie/classic_torso.mdl", head = Vector(14, 0, 14) },
+    [6] = { model = "models/zombie/poison.mdl",        head = Vector(12, 0, 52) },
+}
+
+local FX = { FLASH = 1, SHAKE = 2, SUB = 3, OBJ = 4, SCARE = 5, TENSION = 6, TITLE = 7, TV = 8 }
+
+if SERVER then
+---------------------------------------------------------------------------
+-- SERVER: core
+---------------------------------------------------------------------------
+
+local now = timer.curtime()
+local dt = 0.015
+local ready = false
+local E = { mannequins = {}, dolls = {}, bodies = {}, candles = {} }   -- named entities
+local UP = Vector(0, 0, 1)
+
+local function say(...)
+    print(Color(190, 40, 40), "[WARD 13] ", Color(225, 225, 225), ...)
+end
+
+-- The ward is laid out in front of the owner, starting a little past the chip.
+do
+    local c = chip()
+    local cpos = c:getPos()
+    local yaw = c:getAngles().y
+    local o = owner()
+    if isValid(o) then
+        local d = cpos - o:getPos()
+        local flat = Vector(d.x, d.y, 0)
+        if flat:getLength() > 16 then yaw = flat:getAngle().y end
+    end
+    if CONFIG.SNAP_YAW > 0 then yaw = math.floor(yaw / CONFIG.SNAP_YAW + 0.5) * CONFIG.SNAP_YAW end
+    BASE = Angle(0, yaw, 0)
+    local start = cpos + BASE:getForward() * CONFIG.FRONT_OFFSET
+    local gz = cpos.z
+    local ok, tr = pcall(trace.line, start + Vector(0, 0, 72), start - Vector(0, 0, 600), nil, MASK.SOLID_BRUSHONLY)
+    if ok and tr and tr.Hit then gz = tr.HitPos.z end
+    ORIGIN = Vector(start.x, start.y, gz + 3.5)
+end
+
+local function V(v) return clamp((v or 1) * CONFIG.VOLUME, 0, 1) end
+
+local function sndAt(path, lpos, level, pitch, vol)
+    local wp = toWorld(lpos)
+    pcall(sound.emitSound, path, wp, level or 75, pitch or 100, V(vol))
+end
+
+local function sndOn(ent, path, level, pitch, vol)
+    if not isValid(ent) then return end
+    pcall(ent.emitSound, ent, path, level or 75, pitch or 100, V(vol))
+end
+
+local function spark(lpos, scale)
+    local wp = toWorld(lpos)
+    pcall(effect.create, "ElectricSpark", { origin = wp, normal = Vector(0, 0, -1), magnitude = scale or 2, scale = scale or 2, radius = 4 })
+end
+
+---------------------------------------------------------------------------
+-- Task scheduler: choreography is written as coroutines that wait().
+---------------------------------------------------------------------------
+local tasks = {}
+
+local function spawnTask(name, fn, onError)
+    local t = { name = name, co = coroutine.create(fn), wake = 0, onError = onError }
+    tasks[#tasks + 1] = t
+    return t
+end
+
+local function wait(t) coroutine.yield(t or 0) end
+
+local function waitUntil(pred, timeout)
+    local limit = now + (timeout or 1e9)
+    while not pred() do
+        if now >= limit then return false end
+        coroutine.yield(0.05)
+    end
+    return true
+end
+
+local function after(delay, fn)
+    return spawnTask("after", function() wait(delay) fn() end)
+end
+
+local function runTasks()
+    local i = 1
+    while i <= #tasks do
+        local t = tasks[i]
+        if t.dead then
+            table.remove(tasks, i)
+        else
+            if now >= t.wake then
+                local ok, delay = pcall(coroutine.resume, t.co)
+                if not ok then
+                    t.dead = true
+                    say("task '" .. t.name .. "' stopped: " .. tostring(delay))
+                    if t.onError then pcall(t.onError) end
+                elseif coroutine.status(t.co) == "dead" then
+                    t.dead = true
+                else
+                    t.wake = now + (tonumber(delay) or 0)
+                end
+            end
+            i = i + 1
+        end
+    end
+end
+
+local function killTasks()
+    for _, t in ipairs(tasks) do
+        if not t.keep then t.dead = true end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Networking (queued so a burst of effects can never trip the net limit)
+---------------------------------------------------------------------------
+local outbox = {}
+local function post(fn) outbox[#outbox + 1] = fn end
+
+local function flushNet()
+    local sent = 0
+    while outbox[1] and sent < 10 do
+        local okb, left = pcall(net.getBytesLeft)
+        if okb and left and left < 600 then return end
+        local fn = table.remove(outbox, 1)
+        local ok, err = pcall(fn)
+        if not ok then say("net: " .. tostring(err)) end
+        sent = sent + 1
+    end
+end
+
+local function validPlayers(list)
+    if not list then return nil end
+    local r = {}
+    for _, p in ipairs(list) do
+        if isValid(p) then r[#r + 1] = p end
+    end
+    return r
+end
+
+local persist = { objective = "", tension = 0, tvState = 0, tvText = "" }
+
+local function fx(targets, kind, a, b, c, d, e)
+    if targets and #targets == 0 then return end
+    if not targets then
+        if kind == FX.OBJ then persist.objective = a or "" end
+        if kind == FX.TENSION then persist.tension = a or 0 end
+        if kind == FX.TV then persist.tvState, persist.tvText = a or 0, b or "" end
+    end
+    post(function()
+        local to = validPlayers(targets)
+        if to and #to == 0 then return end
+        net.start("hr_fx")
+        net.writeUInt(kind, 5)
+        if kind == FX.FLASH then
+            net.writeUInt(a, 8) net.writeUInt(b, 8) net.writeUInt(c, 8) net.writeUInt(d, 8) net.writeFloat(e or 0.5)
+        elseif kind == FX.SHAKE then
+            net.writeFloat(a) net.writeFloat(b) net.writeFloat(c)
+        elseif kind == FX.SUB then
+            net.writeString(a) net.writeFloat(b or 4)
+        elseif kind == FX.OBJ then
+            net.writeString(a or "")
+        elseif kind == FX.SCARE then
+            net.writeUInt(a, 4) net.writeFloat(b or 0.7)
+        elseif kind == FX.TENSION then
+            net.writeUInt(math.floor(clamp(a or 0, 0, 1) * 255), 8)
+        elseif kind == FX.TITLE then
+            net.writeString(a) net.writeString(b or "") net.writeFloat(c or 6)
+        elseif kind == FX.TV then
+            net.writeUInt(a or 0, 2) net.writeString(b or "")
+        end
+        net.send(to)
+    end)
+end
+
+-- Lamps -------------------------------------------------------------------
+local lampState = {}
+
+local function writeLamp(id)
+    local s = lampState[id]
+    net.writeUInt(s.mode, 4)
+    net.writeUInt(s.r, 8) net.writeUInt(s.g, 8) net.writeUInt(s.b, 8)
+    net.writeUInt(clamp(math.floor(s.level * 100 + 0.5), 0, 255), 8)
+end
+
+local function lampPost(id)
+    local s = lampState[id]
+    if s.dirty then return end
+    s.dirty = true
+    post(function()
+        s.dirty = false
+        net.start("hr_lamp")
+        net.writeUInt(id, 6)
+        writeLamp(id)
+        net.send()
+    end)
+end
+
+-- t may contain mode, level and col = { r, g, b }
+local function lampSet(id, t)
+    local s = lampState[id]
+    if not s then return end
+    if t.mode then s.mode = t.mode end
+    if t.level then s.level = t.level end
+    if t.col then s.r, s.g, s.b = t.col[1], t.col[2], t.col[3] end
+    lampPost(id)
+end
+
+local function lampDefault(id)
+    local d = LAMP_DEFAULT[id]
+    local s = lampState[id] or {}
+    lampState[id] = s
+    s.mode, s.r, s.g, s.b, s.level = d[1], d[2], d[3], d[4], d[5]
+    lampPost(id)
+end
+
+-- Interactables -----------------------------------------------------------
+local intState = {}
+
+local function intSet(id, active, handler)
+    local s = intState[id]
+    if not s then s = { active = false } intState[id] = s end
+    if handler ~= nil then s.handler = handler end
+    if s.active ~= active then
+        s.active = active
+        post(function()
+            net.start("hr_int")
+            net.writeUInt(id, 5)
+            net.writeBool(s.active == true)
+            net.send()
+        end)
+    end
+end
+
+local function sendSync(ply)
+    post(function()
+        if ply ~= nil and not isValid(ply) then return end
+        net.start("hr_sync")
+        net.writeFloat(ORIGIN.x) net.writeFloat(ORIGIN.y) net.writeFloat(ORIGIN.z)
+        net.writeFloat(BASE.y)
+        net.writeBool(ready)
+        for id = 1, #LAMPS do writeLamp(id) end
+        local mask = 0
+        for id, s in pairs(intState) do
+            if s.active then mask = mask + 2 ^ (id - 1) end
+        end
+        net.writeUInt(mask, 16)
+        net.writeString(persist.objective)
+        net.writeUInt(math.floor(clamp(persist.tension, 0, 1) * 255), 8)
+        net.writeUInt(persist.tvState, 2)
+        net.writeString(persist.tvText)
+        net.send(ply)
+    end)
+end
+
+---------------------------------------------------------------------------
+-- Player tracking
+---------------------------------------------------------------------------
+local roster = {}
+local byChamber = {}
+for k = 0, 10 do byChamber[k] = {} end
+local rosterAt, trackAt = 0, 0
+
+local function refreshPlayers()
+    if now >= rosterAt then
+        rosterAt = now + 1
+        local seen = {}
+        for _, e in ipairs(roster) do seen[e.ply] = e end
+        local list = find.allPlayers()
+        roster = {}
+        for i, p in ipairs(list) do
+            roster[i] = seen[p] or { ply = p, k = 0, lpos = Vector(0, 0, 0) }
+        end
+    end
+    if now < trackAt then return end
+    trackAt = now + 0.05
+    for k = 0, 10 do byChamber[k] = {} end
+    for _, e in ipairs(roster) do
+        local p = e.ply
+        if isValid(p) and p:isAlive() then
+            e.lpos = toLocal(p:getPos())
+            e.k = chamberAt(e.lpos)
+            local t = byChamber[e.k]
+            t[#t + 1] = e
+        else
+            e.k = -1
+        end
+    end
+end
+
+local function occ(k) return byChamber[k] end
+
+local function plysOf(list)
+    local r = {}
+    for i, e in ipairs(list) do r[i] = e.ply end
+    return r
+end
+
+-- Everyone inside chambers a..b
+local function crowd(a, b)
+    local r = {}
+    for k = a, b or a do
+        for _, e in ipairs(byChamber[k]) do r[#r + 1] = e end
+    end
+    return r
+end
+
+local function insiders() return plysOf(crowd(1, 10)) end
+
+local function nearest(lpos, list)
+    local best, bestD
+    for _, e in ipairs(list) do
+        local d = e.lpos:getDistance(lpos)
+        if not bestD or d < bestD then best, bestD = e, d end
+    end
+    return best, bestD
+end
+
+local function eyeOf(e) return toLocal(e.ply:getShootPos()) end
+local function aimOf(e) return dirToLocal(e.ply:getAimVector()) end
+
+local function sees(e, lpos, minDot)
+    local to = lpos - eyeOf(e)
+    local d = to:getLength()
+    if d < 1 then return true end
+    return aimOf(e):dot(to / d) > (minDot or 0.6)
+end
+
+local function yawTo(from, to)
+    return math.deg(math.atan2(to.y - from.y, to.x - from.x))
+end
+
+-- Shorthand for the usual "something got you" package.
+local function scare(e, idx, dur)
+    if not e then return end
+    local t = { e.ply }
+    fx(t, FX.SCARE, idx, dur or 0.75)
+    fx(t, FX.FLASH, 255, 255, 255, 110, 0.5)
+    fx(t, FX.SHAKE, 14, 22, 0.9)
+end
+
+local function sub(text, dur, targets) fx(targets or insiders(), FX.SUB, text, dur or 4) end
+local function objective(text) fx(nil, FX.OBJ, text) end
+local function tension(level) fx(nil, FX.TENSION, level) end
+
+---------------------------------------------------------------------------
+-- Spawning helpers
+---------------------------------------------------------------------------
+local BOX    = "models/starfall/holograms/box.mdl"
+local SPHERE = "models/starfall/holograms/sphere.mdl"
+local CYL    = "models/starfall/holograms/cylinder.mdl"
+
+local spawned = 0
+local skipped = 0
+
+-- Called between spawns while building so the chip stays far below its CPU quota.
+local function breathe()
+    spawned = spawned + 1
+    if spawned % 3 == 0 or cpuAverage() > cpuMax() * 0.3 then coroutine.yield(0) end
+end
+
+-- Decor is tinted down with the room so nothing glows in the dark.
+local function dim(r, g, b, mul)
+    local m = clamp(CONFIG.AMBIENT * 1.35 * (mul or 1), 0, 1)
+    return Color(math.floor(r * m), math.floor(g * m), math.floor(b * m))
+end
+
+local function holoRaw(models, wpos, wang, scale)
+    if isstring(models) then models = { models } end
+    for _, m in ipairs(models) do
+        if not hologram.canSpawn() then break end
+        local ok, h = pcall(hologram.create, wpos, wang, m, scale)
+        if ok and h then return h end
+    end
+    skipped = skipped + 1
+    return nil
+end
+
+local function glow(h)
+    if not h then return end
+    pcall(h.setMaterial, h, "debug/debugdrawflat")
+    pcall(h.suppressEngineLighting, h, true)
+end
+
+-- Unit-cube primitives: scale is the size in units.
+local function prim(mdl, lpos, size, lang, col, mat)
+    local wp, wa = toWorld(lpos, lang)
+    local h = holoRaw(mdl, wp, wa, size)
+    if not h then return nil end
+    if col then h:setColor(col) end
+    if mat then pcall(h.setMaterial, h, mat) end
+    return h
+end
+local function box(lpos, size, lang, col, mat) return prim(BOX, lpos, size, lang, col, mat) end
+
+-- A model placed by its origin (characters stand on their origin).
+local function figure(models, lpos, lang, scale, col)
+    local wp, wa = toWorld(lpos, lang)
+    local h = holoRaw(models, wp, wa, scale and Vector(scale, scale, scale) or nil)
+    if not h then return nil end
+    if col then h:setColor(col) end
+    return h
+end
+
+local function bounds(ent)
+    local mins, maxs = ent:obbMins(), ent:obbMaxs()
+    if (maxs - mins):getLength() < 1 then
+        local ok, a, b = pcall(ent.getModelBounds, ent)
+        if ok and a and b then mins, maxs = a, b end
+    end
+    return mins, maxs
+end
+
+-- Rests an entity's bounding box on a floor point, centred, turned to a local yaw.
+local function seat(ent, lpos, lyaw, scale)
+    scale = scale or 1
+    local wp, wa = toWorld(lpos, Angle(0, lyaw or 0, 0))
+    ent:setAngles(wa)
+    local mins, maxs = bounds(ent)
+    local c = (mins + maxs) * (0.5 * scale)
+    local off = localToWorld(Vector(c.x, c.y, mins.z * scale), ANG0, VEC0, wa)
+    ent:setPos(wp - off)
+end
+
+-- Furniture hologram standing on the floor.
+local function furn(models, lpos, lyaw, scale, col)
+    local wp = toWorld(lpos)
+    local h = holoRaw(models, wp, ANG0, scale and Vector(scale, scale, scale) or nil)
+    if not h then return nil end
+    seat(h, lpos, lyaw, scale)
+    h:setColor(col or dim(255, 255, 255))
+    return h
+end
+
+-- Props can only be spawned a few per second; this waits for the budget (build task only).
+local function propRaw(mdl, wpos, wang)
+    local tries = 0
+    while not prop.canSpawn() do
+        tries = tries + 1
+        if tries > 600 then return nil, "prop limit reached" end
+        coroutine.yield(0.05)
+    end
+    local ok, ent = pcall(prop.create, wpos, wang, mdl, true)
+    if not ok then return nil, tostring(ent) end
+    pcall(ent.setDrawShadow, ent, false)
+    return ent
+end
+
+local function solidFurn(mdl, lpos, lyaw, col)
+    local ent, err = propRaw(mdl, toWorld(lpos + Vector(0, 0, 40)), ANG0)
+    if not ent then return nil, err end
+    seat(ent, lpos, lyaw)
+    ent:setColor(col or dim(255, 255, 255))
+    return ent
+end
+
+local AX = { x = Vector(1, 0, 0), y = Vector(0, 1, 0), z = Vector(0, 0, 1) }
+local warnedPlate = false
+
+-- Fits a PHX plate into a slab of the room. kind: "floor" (len1 along X, len2 along Y),
+-- "wallx" (plane across X: len1 along Y, len2 up) or "wally" (plane across Y: len1 along X, len2 up).
+-- The model's real bounding box decides its rotation, so axis conventions don't matter.
+local function plate(mdl, kind, center, len1, len2, mat, col)
+    local n, t1, t2
+    if kind == "floor" then n, t1, t2 = AX.z, AX.x, AX.y
+    elseif kind == "wallx" then n, t1, t2 = AX.x, AX.y, AX.z
+    else n, t1, t2 = AX.y, AX.x, AX.z end
+    local wn, w1, w2 = dirToWorld(n), dirToWorld(t1), dirToWorld(t2)
+    local wc = toWorld(center)
+
+    local ent, err = propRaw("models/hunter/plates/" .. mdl .. ".mdl", wc, ANG0)
+    if not ent then return nil, err end
+
+    local size = ent:obbSize()
+    local fwd = (math.abs(size.x - len1) <= math.abs(size.x - len2)) and w1 or w2
+    ent:setAngles(fwd:getAngleEx(wn))
+    ent:setPos(ent:getPos() + (wc - ent:localToWorld(ent:obbCenter())))
+
+    local long, short = math.max(size.x, size.y), math.min(size.x, size.y)
+    if not warnedPlate and (math.abs(long - math.max(len1, len2)) > 4 or math.abs(short - math.min(len1, len2)) > 4) then
+        warnedPlate = true
+        say("warning: " .. mdl .. " is not the size the layout expects; walls may not line up.")
+    end
+
+    if mat then pcall(ent.setMaterial, ent, mat) end
+    if col then ent:setColor(col) end
+    return ent
+end
+
+---------------------------------------------------------------------------
+-- Doors (slabs that rise into the ceiling)
+---------------------------------------------------------------------------
+local doors = {}
+
+local function doorClear(i)
+    local g = G[i]
+    for _, e in ipairs(roster) do
+        if e.k and e.k >= 0 and math.abs(e.lpos.x - g.x) < 44 and math.abs(e.lpos.y - g.y) < 64 and e.lpos.z < H then
+            return false
+        end
+    end
+    return true
+end
+
+local function doorMove(i, target, dur, slam)
+    local d = doors[i]
+    if not d or d.target == target then return end
+    d.target, d.dur, d.slam = target, math.max(dur, 0.05), slam
+    if not slam then sndOn(d.ent, "doors/heavy_metal_move1.wav", 80, target == 1 and 92 or 100, 0.9) end
+end
+
+local function doorOpen(i, dur) doorMove(i, 1, dur or 2.6) end
+local function doorClose(i, dur, slam) doorMove(i, 0, dur or 1.6, slam) end
+
+-- Slams a door shut, but never on top of somebody standing in the doorway (call from a task).
+local function slamDoor(i)
+    if not waitUntil(function() return doorClear(i) end, 3) then return false end
+    doorClose(i, 0.15, true)
+    return true
+end
+
+local function updateDoors()
+    for i = 0, 10 do
+        local d = doors[i]
+        if d and d.t ~= d.target and isValid(d.ent) then
+            local step = dt / d.dur
+            if d.target > d.t then d.t = math.min(d.t + step, d.target) else d.t = math.max(d.t - step, d.target) end
+            local s = d.t * d.t * (3 - 2 * d.t)
+            d.ent:setPos(d.closed + UP * (s * (H - 1)))
+            if d.t == d.target then
+                if d.slam then
+                    sndOn(d.ent, "doors/heavy_metal_stop1.wav", 95, 85, 1)
+                    sndOn(d.ent, "physics/metal/metal_box_impact_hard2.wav", 95, 70, 1)
+                else
+                    sndOn(d.ent, "doors/heavy_metal_stop1.wav", 78, 100, 0.8)
+                end
+            end
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Actors: holograms that are hidden until a scene needs them
+---------------------------------------------------------------------------
+local actors = {}
+
+local function actor(models, scale, col)
+    local h = figure(models, Vector(-200, 0, -400), ANG0, scale, col)
+    if not h then return nil end
+    h:setNoDraw(true)
+    local a = { h = h, pos = Vector(0, 0, 0), yaw = 0, shown = false }
+    actors[#actors + 1] = a
+    return a
+end
+
+local function alive(a) return a ~= nil and isValid(a.h) end
+
+local function actorPlace(a, lpos, yaw, lang)
+    if not alive(a) then return end
+    a.pos = lpos
+    a.yaw = yaw or a.yaw
+    local wp, wa = toWorld(lpos, lang or Angle(0, a.yaw, 0))
+    a.h:setPos(wp)
+    a.h:setAngles(wa)
+end
+
+local function actorShow(a, on)
+    if not alive(a) or a.shown == on then return end
+    a.shown = on
+    a.h:setNoDraw(not on)
+end
+
+local function actorAnim(a, names, rate)
+    if not alive(a) then return end
+    for _, n in ipairs(names) do
+        local ok, id = pcall(a.h.lookupSequence, a.h, n)
+        if ok and id and id >= 0 then
+            pcall(a.h.setAnimation, a.h, id, 0, rate or 1)
+            return
+        end
+    end
+end
+
+-- Moves an actor in a straight line; call from a task. stop() may abort the walk.
+local function actorWalk(a, to, speed, steps, stride, stop)
+    if not alive(a) then return end
+    local nextStep = 0
+    while true do
+        local d = to - a.pos
+        local dist = d:getLength()
+        if dist < 2 then break end
+        local move = math.min(dist, speed * dt)
+        actorPlace(a, a.pos + d * (move / dist), yawTo(a.pos, to))
+        if steps and now >= nextStep then
+            nextStep = now + (stride or 0.4)
+            sndOn(a.h, pick(steps), 80, math.random(90, 105), 0.9)
+        end
+        if stop and stop() then return true end
+        coroutine.yield(0)
+    end
+end
+
+---------------------------------------------------------------------------
+-- SERVER: looping sounds and small scene helpers
+---------------------------------------------------------------------------
+local loops = {}
+
+local function loopStop(name, fade)
+    local s = loops[name]
+    if not s then return end
+    loops[name] = nil
+    pcall(s.stop, s, fade or 0)
+    if fade and fade > 0 then
+        after(fade + 0.2, function() pcall(s.destroy, s) end).keep = true
+    else
+        pcall(s.destroy, s)
+    end
+end
+
+-- Anything that might be a looping wav goes through here so it can always be stopped.
+local function loopStart(name, ent, path, vol, pitch, level)
+    loopStop(name)
+    if not isValid(ent) or not sound.canCreate() then return nil end
+    local ok, s = pcall(sound.create, ent, path)
+    if not ok or not s then return nil end
+    loops[name] = s
+    pcall(function()
+        if level then s:setSoundLevel(level) end
+        s:play()
+        s:setVolume(V(vol))
+        if pitch then s:setPitch(pitch) end
+    end)
+    return s
+end
+
+local function loopTune(name, vol, pitch, fade)
+    local s = loops[name]
+    if not s then return end
+    pcall(function()
+        if vol then s:setVolume(V(vol), fade or 0) end
+        if pitch then s:setPitch(pitch, fade or 0) end
+    end)
+end
+
+local function loopStopAll()
+    for name in pairs(loops) do loopStop(name) end
+end
+
+local function series(fmt, a, b)
+    local t = {}
+    for i = a, b do t[#t + 1] = string.format(fmt, i) end
+    return t
+end
+
+local WHISPERS    = { "ambient/levels/citadel/strange_talk1.wav", "ambient/levels/citadel/strange_talk3.wav",
+                      "ambient/levels/citadel/strange_talk4.wav", "ambient/levels/citadel/strange_talk5.wav",
+                      "ambient/levels/citadel/strange_talk6.wav", "ambient/levels/citadel/strange_talk7.wav",
+                      "ambient/levels/citadel/strange_talk8.wav", "ambient/levels/citadel/strange_talk9.wav",
+                      "ambient/levels/citadel/strange_talk10.wav", "ambient/levels/citadel/strange_talk11.wav" }
+local CREAKS      = series("ambient/materials/wood_creak%d.wav", 1, 6)
+local STRESS      = series("ambient/materials/metal_stress%d.wav", 1, 5)
+local BOOMS       = series("ambient/atmosphere/cave_hit%d.wav", 1, 6)
+local ZAPS        = { "ambient/energy/zap1.wav", "ambient/energy/zap2.wav", "ambient/energy/zap3.wav", "ambient/energy/zap5.wav",
+                      "ambient/energy/zap6.wav", "ambient/energy/zap7.wav", "ambient/energy/zap8.wav", "ambient/energy/zap9.wav" }
+local SPARKS      = series("ambient/energy/spark%d.wav", 1, 6)
+local HEAVY_STEPS = { "npc/zombie_poison/pz_left_foot1.wav", "npc/zombie_poison/pz_right_foot1.wav" }
+local FAST_STEPS  = series("npc/fast_zombie/foot%d.wav", 1, 3)
+local SCRAPES     = series("physics/concrete/concrete_impact_soft%d.wav", 1, 3)
+local CHAINS      = series("physics/metal/metal_chainlink_impact_soft%d.wav", 1, 3)
+local GRATES      = series("physics/metal/metal_grate_impact_hard%d.wav", 1, 3)
+local SPLASH      = series("ambient/water/water_splash%d.wav", 1, 3)
+local SOBS        = { "ambient/creatures/town_scared_sob1.wav", "ambient/creatures/town_scared_sob2.wav" }
+local VORT        = { "vo/npc/vortigaunt/vortigese02.wav", "vo/npc/vortigaunt/vortigese04.wav", "vo/npc/vortigaunt/vortigese09.wav",
+                      "vo/npc/vortigaunt/vortigese11.wav", "vo/npc/vortigaunt/vortigese12.wav" }
+local CHARPLES    = { "models/humans/charple01.mdl", "models/humans/charple02.mdl", "models/humans/charple03.mdl", "models/humans/charple04.mdl" }
+
+local function angToWorld(la)
+    local _, a = localToWorld(VEC0, la, VEC0, BASE)
+    return a
+end
+
+local function setLocal(h, lpos, lang)
+    if not isValid(h) then return end
+    local wp, wa = toWorld(lpos, lang)
+    h:setPos(wp)
+    h:setAngles(wa)
+end
+
+local function clampInto(k, p, margin)
+    local cx, cy = chamberCenter(k)
+    local r = CELL / 2 - (margin or 20)
+    return Vector(clamp(p.x, cx - r, cx + r), clamp(p.y, cy - r, cy + r), p.z)
+end
+
+local function blood(lpos, dir)
+    if not trace.canCreateDecal() then return end
+    local a = toWorld(lpos)
+    local b = toWorld(lpos + (dir or Vector(0, 0, -40)))
+    pcall(trace.decal, "Blood", a, b)
+end
+
+-- Wall levers: a back plate, an arm and a knob built from primitives.
+local function leverSet(lv, theta)
+    lv.theta = theta
+    local dirAng = Angle(-theta, lv.yaw, 0)
+    local d = dirAng:getForward()
+    local p0 = lv.base + Angle(0, lv.yaw, 0):getForward() * 3
+    setLocal(lv.arm, p0 + d * 11, dirAng)
+    setLocal(lv.knob, p0 + d * 22, ANG0)
+end
+
+local function makeLever(base, yaw)
+    local lv = { base = base, yaw = yaw }
+    lv.plate = box(base, Vector(4, 14, 30), Angle(0, yaw, 0), dim(95, 95, 100), CONFIG.MAT.partition)
+    lv.arm   = box(base, Vector(22, 2.4, 2.4), ANG0, dim(170, 170, 175))
+    lv.knob  = prim(SPHERE, base, Vector(5.5, 5.5, 5.5), ANG0, dim(230, 40, 35, 1.6))
+    leverSet(lv, 50)
+    return lv
+end
+
+local function leverThrow(lv)
+    local t0 = now
+    while now - t0 < 0.3 do
+        leverSet(lv, lerp(50, -50, (now - t0) / 0.3))
+        coroutine.yield(0)
+    end
+    leverSet(lv, -50)
+end
+
+---------------------------------------------------------------------------
+-- SERVER: construction
+---------------------------------------------------------------------------
+local function shadeCol(r, g, b, mul)
+    local m = clamp(CONFIG.AMBIENT * (mul or 1), 0, 1)
+    return Color(math.floor(r * m), math.floor(g * m), math.floor(b * m))
+end
+
+local function buildStructure()
+    local M = CONFIG.MAT
+    local floorC, wallC = shadeCol(205, 190, 170, 0.8), shadeCol(215, 205, 190)
+    local ceilC, partC  = shadeCol(190, 185, 180, 1.15), shadeCol(205, 200, 190)
+    local w, f, c, p = M.wall, M.floor, M.ceiling, M.partition
+    local hz = H / 2
+    local list = {
+        -- floor and ceiling
+        { "plate16x32", "floor", 16 * U, 0, -1.5,    32 * U, 16 * U, f, floorC },
+        { "plate8x16",  "floor", 36 * U, 0, -1.5,    8 * U,  16 * U, f, floorC },
+        { "plate16x32", "floor", 16 * U, 0, H + 1.5, 32 * U, 16 * U, c, ceilC },
+        { "plate8x16",  "floor", 36 * U, 0, H + 1.5, 8 * U,  16 * U, c, ceilC },
+        -- outer walls
+        { "plate4x32", "wally", 16 * U, 8 * U,  hz, 32 * U, H, w, wallC },
+        { "plate4x8",  "wally", 36 * U, 8 * U,  hz, 8 * U,  H, w, wallC },
+        { "plate4x32", "wally", 16 * U, -8 * U, hz, 32 * U, H, w, wallC },
+        { "plate4x8",  "wally", 36 * U, -8 * U, hz, 8 * U,  H, w, wallC },
+        { "plate4x16", "wallx", 40 * U, 0,      hz, 16 * U, H, w, wallC },
+        { "plate3x4",  "wallx", 0, -6.5 * U,    hz, 3 * U,  H, w, wallC },
+        { "plate4x6",  "wallx", 0, 0,           hz, 6 * U,  H, w, wallC },
+        { "plate3x4",  "wallx", 0, 6.5 * U,     hz, 3 * U,  H, w, wallC },
+        -- spine between the two rows (open at the far end)
+        { "plate4x32", "wally", 16 * U, 0, hz, 32 * U, H, w, wallC },
+        { "plate4x6",  "wally", 35 * U, 0, hz, 6 * U,  H, w, wallC },
+        -- partitions, each leaving a doorway on alternating sides
+        { "plate4x6", "wallx", 8 * U,  3 * U,  hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 16 * U, 5 * U,  hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 24 * U, 3 * U,  hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 32 * U, 5 * U,  hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 32 * U, -3 * U, hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 24 * U, -5 * U, hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 16 * U, -3 * U, hz, 6 * U, H, p, partC },
+        { "plate4x6", "wallx", 8 * U,  -5 * U, hz, 6 * U, H, p, partC },
+    }
+    for _, s in ipairs(list) do
+        local ent, err = plate(s[1], s[2], Vector(s[3], s[4], s[5]), s[6], s[7], s[8], s[9])
+        if not ent then return false, err end
+    end
+
+    -- interior walls that have to be solid
+    plate("plate4x4", "wallx", P(7, -95, 100, hz), 4 * U, H, p, partC)                 -- end wall of the cells
+    local bars, err = plate("plate4x6", "wally", P(7, 47.45, 10, hz), 6 * U, H)        -- invisible stop behind the bars
+    if not bars then return false, err end
+    bars:setColor(Color(255, 255, 255, 0))
+    pcall(bars.setRenderMode, bars, RENDERMODE.TRANSCOLOR)
+    plate("plate2x4", "wally", P(9, -142.5, -80, hz), 2 * U, H, p, partC)              -- hiding nook
+    plate("plate1x4", "wallx", P(9, -95, -166.3, hz), 1 * U, H, p, partC)
+    plate("plate4x6", "wallx", P(10, 63, 47.5, hz), 6 * U, H, p, partC)                -- final run
+    plate("plate4x6", "wallx", P(10, -63, -47.5, hz), 6 * U, H, p, partC)
+
+    local doorC = shadeCol(170, 150, 135, 0.9)
+    for i = 0, 10 do
+        local g = G[i]
+        local ent, derr = plate("plate2x4", g.kind, Vector(g.x, g.y, hz), 2 * U, H, M.door, doorC)
+        if not ent then return false, derr end
+        doors[i] = { ent = ent, closed = ent:getPos(), t = 0, target = 0, dur = 1 }
+    end
+    return true
+end
+
+-- The cast is created first so a tight hologram budget costs decor, not monsters.
+local function buildCast()
+    E.glimpse  = actor({ "models/humans/charple02.mdl", "models/humans/charple01.mdl" }, 1.05, Color(16, 16, 16))
+    E.watcher  = actor({ "models/humans/charple03.mdl", "models/humans/charple01.mdl" }, 1.08, Color(14, 14, 14))
+    E.butcher  = actor({ "models/zombie/poison.mdl", "models/zombie/classic.mdl" }, 1.15, Color(125, 62, 55))
+    E.dropBody = actor(CHARPLES, 1.0, dim(170, 130, 120))
+    E.summoned = actor({ "models/stalker.mdl", "models/humans/charple04.mdl" }, 1.55, Color(48, 34, 34))
+    E.inmate   = actor({ "models/zombie/classic.mdl" }, 1.0, dim(215, 205, 195))
+    E.sobber   = actor({ "models/humans/charple03.mdl", "models/humans/charple01.mdl" }, 0.95, Color(34, 30, 30))
+    E.escapee  = actor({ "models/zombie/fast.mdl", "models/zombie/classic.mdl" }, 1.0, Color(30, 26, 26))
+    E.torso    = actor({ "models/zombie/classic_torso.mdl", "models/zombie/classic.mdl" }, 1.1, dim(225, 215, 205))
+    E.warden   = actor({ "models/stalker.mdl", "models/zombie/poison.mdl" }, 1.4, Color(66, 54, 50))
+    breathe()
+
+    E.mannequins = {}
+    local homes = { { -60, 160, -90 }, { 70, -165, 90 }, { 160, -120, 180 }, { 0, 30, 200 }, { -150, 60, 0 } }
+    for i, hm in ipairs(homes) do
+        local a = actor(CHARPLES[(i - 1) % 4 + 1], 1.0, dim(150, 140, 130))
+        if a then
+            a.home, a.homeYaw = P(3, hm[1], hm[2], 0), hm[3]
+            E.mannequins[#E.mannequins + 1] = a
+        end
+        breathe()
+    end
+end
+
+local CHAIR = "models/props_c17/furniturechair001a.mdl"
+local WOOD  = "phoenix_storms/wood"
+
+local decor = {}
+
+decor[1] = function()
+    solidFurn("models/props_c17/furniturecouch001a.mdl", P(1, -90, -158, 0), 90)
+    furn("models/props_c17/furnituretable001a.mdl", P(1, 40, -90, 0), 0)
+    furn(CHAIR, P(1, 46, -138, 0), 90)
+    furn("models/props_c17/furnituredrawer001a.mdl", P(1, 150, -110, 0), 180)
+    breathe()
+    furn("models/props_c17/suitcase001a.mdl", P(1, -120, 60, 0), 25)
+    furn("models/props_c17/briefcase001a.mdl", P(1, -96, 84, 0), -40)
+    furn("models/props_junk/shoe001a.mdl", P(1, 10, 30, 0), 70)
+    figure(CHAIR, P(1, 95, 40, 12), Angle(0, 40, 90), nil, dim(255, 255, 255))      -- knocked over
+    furn("models/props_junk/wood_crate001a.mdl", P(1, -158, 150, 0), 12)
+    breathe()
+    blood(P(1, -60, -120, 10))
+    blood(P(1, 120, 100, 10))
+    blood(P(1, 180, 0, 70), Vector(30, 0, 0))
+end
+
+decor[2] = function()
+    solidFurn("models/props_c17/furniturecouch001a.mdl", P(2, 40, 60, 0), 0)
+    -- a boxy old television on a cabinet
+    box(P(2, 150, 60, 17), Vector(34, 64, 34), ANG0, dim(125, 98, 72), WOOD)
+    E.tv = box(SPOT.tv, Vector(30, 40, 30), ANG0, dim(72, 68, 62))
+    box(P(2, 134.9, 55, 49), Vector(0.3, 27, 27), ANG0, Color(3, 3, 3))
+    breathe()
+    prim(CYL, P(2, 134.6, 74.5, 56), Vector(3.2, 3.2, 1.6), Angle(90, 0, 0), dim(180, 170, 150))
+    prim(CYL, P(2, 134.6, 74.5, 46), Vector(3.2, 3.2, 1.6), Angle(90, 0, 0), dim(180, 170, 150))
+    box(P(2, 150, 54, 76), Vector(0.6, 0.6, 28), Angle(0, 0, 24), dim(190, 190, 195))
+    box(P(2, 150, 66, 76), Vector(0.6, 0.6, 28), Angle(0, 0, -24), dim(190, 190, 195))
+    breathe()
+    box(P(2, -120, -130, 14), Vector(26, 26, 28), ANG0, dim(112, 86, 62), WOOD)
+    E.radio = furn("models/props_lab/citizenradio.mdl", P(2, -120, -130, 28), 35)
+    furn("models/props_c17/furniturearmchair001a.mdl", P(2, -40, -60, 0), 20)
+    furn("models/props_c17/furnitureshelf001a.mdl", P(2, -60, 160, 0), -90)
+    furn(CHAIR, P(2, 100, -120, 0), 140)
+    breathe()
+    blood(P(2, 60, 20, 10))
+end
+
+decor[3] = function()
+    E.lever3 = makeLever(SPOT.lever, 180)
+    furn("models/props_wasteland/prison_bedframe001b.mdl", P(3, -110, 150, 0), 0)
+    furn("models/props_wasteland/prison_bedframe001b.mdl", P(3, 30, 150, 0), 0)
+    breathe()
+    furn("models/props_c17/furnituremattress001a.mdl", P(3, -120, -150, 0), 15)
+    furn("models/props_junk/metalbucket01a.mdl", P(3, 100, 120, 0), 0)
+    furn("models/props_c17/furnitureradiator001a.mdl", P(3, -20, -176, 0), 90)
+    breathe()
+    blood(P(3, -110, 140, 12))
+    blood(P(3, 40, -20, 10))
+end
+
+decor[4] = function()
+    solidFurn("models/props_c17/furniturebed001a.mdl", P(4, -40, 140, 0), 0)
+    -- the music box, on a low table
+    box(P(4, 60, 40, 13), Vector(30, 30, 26), ANG0, dim(122, 92, 70), WOOD)
+    E.musicbox = box(P(4, 60, 40, 29), Vector(13, 10, 6), ANG0, dim(160, 62, 74))
+    box(P(4, 60, 45.4, 35.5), Vector(13, 0.8, 8), Angle(0, 0, -18), dim(160, 62, 74))
+    E.ballerina = figure("models/props_lab/huladoll.mdl", P(4, 60, 39, 32), ANG0, 1.2, dim(255, 255, 255))
+    prim(CYL, P(4, 67.6, 40, 29), Vector(1.2, 1.2, 5), Angle(90, 0, 0), dim(210, 190, 90))
+    breathe()
+    box(P(4, 178, -20, 45), Vector(18, 112, 2), ANG0, dim(112, 86, 62), WOOD)          -- shelf
+    E.carousel = furn("models/props_c17/playground_carousel01.mdl", P(4, -110, -110, 0), 0, 0.55)
+    if E.carousel then pcall(E.carousel.setAngVel, E.carousel, Angle(0, 9, 0)) end
+    furn(CHAIR, P(4, 120, -70, 0), 200)
+    box(P(4, -20, -60, 5), Vector(10, 10, 10), Angle(0, 20, 0), dim(200, 60, 60))
+    box(P(4, -6, -52, 5), Vector(10, 10, 10), Angle(0, -35, 0), dim(60, 90, 200))
+    box(P(4, -14, -56, 15), Vector(10, 10, 10), Angle(0, 50, 0), dim(210, 190, 60))
+    breathe()
+
+    E.dolls = {}
+    local homes = {
+        { 172, -55, 47, 180 }, { 172, -20, 47, 170 }, { 172, 15, 47, 195 },
+        { -30, 120, 30, -80 }, { 122, -70, 22, 200 }, { -150, 40, 2, 10 }, { 20, -150, 2, 95 }, { -60, -20, 2, -30 },
+    }
+    for _, hm in ipairs(homes) do
+        local home, ang = P(4, hm[1], hm[2], hm[3]), Angle(0, hm[4], 0)
+        local h = figure("models/props_c17/doll01.mdl", home, ang, 1.25, dim(255, 236, 226))
+        if h then E.dolls[#E.dolls + 1] = { h = h, home = home, ang = ang } end
+        breathe()
+    end
+end
+
+decor[5] = function()
+    E.breaker = makeLever(SPOT.breaker, -90)
+    E.bodies = {}
+    local grid = { { -100, -30 }, { -10, -30 }, { 80, -30 }, { -100, 70 }, { -10, 70 }, { 80, 70 } }
+    for i, g in ipairs(grid) do
+        local pivot = P(5, g[1], g[2], 142)
+        box(pivot + Vector(0, 0, (H - 142) / 2), Vector(1.4, 1.4, H - 142), ANG0, dim(70, 64, 58))   -- chain
+        local yaw = math.random(0, 359)
+        local h = figure(CHARPLES[(i - 1) % 4 + 1], pivot, Angle(180, yaw, 0), 1.0, dim(170, 130, 120))
+        if h then E.bodies[#E.bodies + 1] = { h = h, pivot = pivot, yaw = yaw, t0 = -100, amp = 0 } end
+        if i % 2 == 1 then
+            prim(CYL, P(5, g[1], g[2], 0.3), Vector(30 + math.random(0, 12), 30 + math.random(0, 12), 0.5), ANG0, Color(46, 2, 2))
+        end
+        blood(P(5, g[1] + math.random(-12, 12), g[2] + math.random(-12, 12), 10))
+        breathe()
+    end
+    box(P(5, -120, 150, 17), Vector(70, 36, 34), ANG0, dim(160, 160, 165), CONFIG.MAT.partition)   -- cutting table
+    furn("models/props_lab/cleaver.mdl", P(5, -132, 150, 34), 30)
+    furn("models/props_junk/meathook001a.mdl", P(5, -100, 146, 34), 80)
+    furn("models/props_junk/metalbucket01a.mdl", P(5, -70, 118, 0), 0)
+    solidFurn("models/props_c17/furniturefridge001a.mdl", P(5, 158, 150, 0), -90)
+    breathe()
+    blood(P(5, -120, 150, 40))
+    blood(P(5, -150, 100, 10))
+end
+
+decor[6] = function()
+    E.candles = {}
+    for i = 1, 5 do
+        local c = CANDLES[i]
+        prim(CYL, c + Vector(0, 0, 4.5), Vector(3.2, 3.2, 9), ANG0, dim(235, 225, 195))
+        local flame = prim(SPHERE, c + Vector(0, 0, 11.5), Vector(2.2, 2.2, 4.6), ANG0, Color(255, 170, 60))
+        glow(flame)
+        if flame then flame:setNoDraw(true) end
+        local out = c - SPOT.circle
+        out = out / out:getLength()
+        local home, hang = c + out * 16 + Vector(0, 0, 4), Angle(0, yawTo(c, SPOT.circle), 0)
+        local skull = figure("models/gibs/hgibs.mdl", home, hang, 1, dim(235, 228, 208))
+        E.candles[i] = { flame = flame, skull = skull, home = home, hang = hang, lit = false }
+        -- one stroke of the star
+        local j = (i + 1) % 5 + 1
+        local a, b = CANDLES[i], CANDLES[j]
+        box((a + b) * 0.5 + Vector(0, 0, 0.25), Vector(a:getDistance(b), 2.2, 0.4), Angle(0, yawTo(a, b), 0), Color(74, 5, 5))
+        breathe()
+    end
+    for i = 0, 2 do
+        local a = math.rad(40 + i * 120)
+        local p = SPOT.circle + Vector(math.cos(a) * 138, math.sin(a) * 138, 0)
+        furn(CHAIR, clampInto(6, p, 26), yawTo(p, SPOT.circle))
+    end
+    breathe()
+    E.altar = box(P(6, 165, -60, 18), Vector(30, 70, 36), ANG0, dim(96, 74, 58), WOOD)
+    figure("models/gibs/hgibs.mdl", P(6, 162, -44, 40), Angle(0, 180, 0), 1.1, dim(235, 228, 208))
+    box(P(6, 160, -74, 37.5), Vector(12, 16, 3), Angle(0, 12, 0), dim(70, 20, 20))                 -- book
+    box(P(6, 186, -60, 118), Vector(2, 5, 56), ANG0, dim(80, 60, 45), WOOD)                        -- inverted cross
+    box(P(6, 186, -60, 101), Vector(2, 30, 5), ANG0, dim(80, 60, 45), WOOD)
+    breathe()
+    blood(SPOT.circle + Vector(0, 0, 10))
+end
+
+decor[7] = function()
+    local barC = dim(105, 100, 95)
+    for i = 0, 15 do
+        local ang = ANG0
+        if i == 2 then ang = Angle(0, 0, 24) elseif i == 3 then ang = Angle(0, 0, -19) end   -- forced apart
+        local b = box(P(7, -95 + i * 19, 10, H / 2), Vector(2.2, 2.2, H), ang, barC, CONFIG.MAT.partition)
+        if i == 8 then E.cellAnchor = b end
+        if i % 4 == 3 then breathe() end
+    end
+    box(P(7, 47.5, 10, 36), Vector(285, 3, 2.2), ANG0, barC, CONFIG.MAT.partition)
+    box(P(7, 47.5, 10, 150), Vector(285, 3, 2.2), ANG0, barC, CONFIG.MAT.partition)
+    local wallC = shadeCol(205, 200, 190)
+    box(P(7, 95, 100, H / 2), Vector(2.5, 180, H), ANG0, wallC, CONFIG.MAT.partition)
+    box(P(7, 0, 100, H / 2), Vector(2.5, 180, H), ANG0, wallC, CONFIG.MAT.partition)
+    breathe()
+    furn("models/props_wasteland/prison_toilet01.mdl", P(7, 172, 168, 0), -90)
+    furn("models/props_wasteland/prison_bedframe001b.mdl", P(7, 62, 150, 0), 0)
+    furn("models/props_wasteland/prison_bedframe001b.mdl", P(7, -50, 150, 0), 0)
+    furn("models/props_c17/doll01.mdl", P(7, -30, 60, 0), 40, 1.2)
+    breathe()
+    -- a trail from the empty cell to the way out
+    local trail = { { -62, 40 }, { -84, 2 }, { -118, -18 }, { -146, 30 }, { -158, 96 } }
+    for _, t in ipairs(trail) do
+        prim(CYL, P(7, t[1], t[2], 0.3), Vector(20 + math.random(0, 10), 16 + math.random(0, 8), 0.5), Angle(0, math.random(0, 180), 0), Color(46, 2, 2))
+        blood(P(7, t[1], t[2], 10))
+    end
+    breathe()
+end
+
+decor[8] = function()
+    local tub = solidFurn("models/props_c17/furniturebathtub001a.mdl", SPOT.tub, 0, dim(240, 240, 230))
+    E.tub = tub
+    E.tubTop = 24
+    if tub then
+        -- the "water" is sized from the tub's own bounding box
+        local mins, maxs = bounds(tub)
+        local sz = maxs - mins
+        E.tubTop = sz.z
+        E.water = box(SPOT.tub + Vector(0, 0, sz.z * 0.78), Vector(sz.x * 0.82, sz.y * 0.74, 0.6), ANG0, Color(52, 2, 2))
+    end
+    furn("models/props_c17/furnituretoilet001a.mdl", P(8, -150, 150, 0), -45)
+    furn("models/props_c17/furnituresink001a.mdl", P(8, -60, 168, 0), -90)
+    breathe()
+    furn("models/props_c17/furniturewashingmachine001a.mdl", P(8, 150, -150, 0), 180)
+    furn("models/props_c17/furnitureradiator001a.mdl", P(8, 60, -176, 0), 90)
+    furn("models/props_junk/metalbucket01a.mdl", P(8, 62, 40, 0), 0)
+    breathe()
+    local pipeC = dim(130, 96, 74)
+    prim(CYL, P(8, 0, 120, H - 16), Vector(7, 7, CELL - 4), Angle(90, 0, 0), pipeC, CONFIG.MAT.wall)
+    prim(CYL, P(8, -110, 0, H - 26), Vector(5, 5, CELL - 4), Angle(90, 90, 0), pipeC, CONFIG.MAT.wall)
+    breathe()
+    for i = 1, 6 do
+        blood(P(8, math.random(-150, 150), math.random(-150, 150), 10))
+    end
+    blood(P(8, 0, 180, 80), Vector(0, 30, 0))
+end
+
+decor[9] = function()
+    solidFurn("models/props_c17/lockers001a.mdl", P(9, 80, 160, 0), -90)
+    furn("models/props_c17/furnituretable002a.mdl", P(9, 60, -20, 0), 15)
+    figure(CHAIR, P(9, 20, 10, 12), Angle(0, 70, 90), nil, dim(255, 255, 255))
+    breathe()
+    furn("models/props_wasteland/controlroom_filecabinet002a.mdl", P(9, 165, 60, 0), 180)
+    furn("models/props_wasteland/controlroom_storagecloset001a.mdl", P(9, 165, 150, 0), 180)
+    furn(CHAIR, P(9, 92, -52, 0), 250)
+    breathe()
+    blood(P(9, -60, -60, 10))
+end
+
+decor[10] = function()
+    furn("models/props_junk/wood_crate001a.mdl", P(10, 150, -160, 0), 30)
+    furn("models/props_c17/oildrum001.mdl", P(10, 168, 60, 0), 0)
+    furn("models/props_junk/cinderblock01a.mdl", P(10, 20, 120, 0), 60)
+    breathe()
+    figure(CHAIR, P(10, -20, -60, 12), Angle(0, 15, 90), nil, dim(255, 255, 255))
+    furn("models/props_junk/wood_pallet001a.mdl", P(10, -150, -150, 0), 20)
+    E.exitSign = box(Vector(4, G[10].y, H - 24), Vector(2, 42, 13), ANG0, Color(40, 255, 100))
+    glow(E.exitSign)
+    breathe()
+    blood(P(10, 120, -40, 10))
+    blood(P(10, -120, 60, 10))
+end
+
+local function buildTerminal()
+    -- a Starfall HUD component by the entrance: USE it to switch the screen effects on
+    box(Vector(-46, 0, 21), Vector(7, 7, 42), ANG0, dim(100, 100, 106), CONFIG.MAT.partition)
+    local tries = 0
+    while not prop.canSpawn() and tries < 100 do tries = tries + 1 coroutine.yield(0.05) end
+    local wp, wa = toWorld(Vector(-46, 0, 44), Angle(0, 180, 0))
+    local ok, hud = pcall(prop.createComponent, wp, wa, "starfall_hud", "models/bull/dynamicbuttonsf.mdl", true)
+    if ok and hud then
+        E.hud = hud
+        pcall(hud.linkComponent, hud, chip())
+    end
+end
+
+local function groundCheck()
+    local worst = 0
+    local probes = { Vector(0, -CELL, 0), Vector(0, CELL, 0), Vector(LEN, -CELL, 0), Vector(LEN, CELL, 0), Vector(LEN / 2, 0, 0) }
+    for _, c in ipairs(probes) do
+        local wp = toWorld(c)
+        local ok, tr = pcall(trace.line, wp + Vector(0, 0, 120), wp - Vector(0, 0, 500), nil, MASK.SOLID_BRUSHONLY)
+        if ok and tr and tr.Hit then
+            worst = math.max(worst, math.abs(tr.HitPos.z - (ORIGIN.z - 3.5)))
+        else
+            worst = 999
+        end
+    end
+    if worst > 28 then
+        say("warning: the ground ahead is not flat or open - the ward needs about 2000 x 800 units of level floor.")
+    end
+end
+
+local function buildAll()
+    groundCheck()
+    local ok, err = buildStructure()
+    if not ok then return false, err end
+    buildCast()
+    for k = 1, 10 do
+        -- each room is dressed by its own task, so one that fails is reported instead of ending the build
+        local done = false
+        spawnTask("dressing room " .. k, function() decor[k]() done = true end, function() done = true end)
+        waitUntil(function() return done end, 60)
+    end
+    buildTerminal()
+    return true
+end
+
+---------------------------------------------------------------------------
+-- SERVER: the ten events
+---------------------------------------------------------------------------
+local EVENTS = {}
+
+-- 1. ADMISSIONS - the way back is gone ------------------------------------
+EVENTS[1] = function()
+    slamDoor(0)
+    wait(0.2)
+    fx(insiders(), FX.SHAKE, 7, 14, 0.7)
+    tension(0.55)
+    wait(0.8)
+    lampSet(1, { mode = MODE.DYING })
+    spark(LAMPS[1].pos, 2)
+    sndAt(pick(SPARKS), LAMPS[1].pos, 85, 100, 1)
+    wait(1.3)
+    lampSet(1, { mode = MODE.OFF })
+    sndAt(pick(ZAPS), LAMPS[1].pos, 82, 90, 1)
+    wait(0.9)
+    -- whispers circle whoever is standing in the dark
+    for i = 1, 6 do
+        local e = nearest(P(1, 0, 0, 0), occ(1))
+        local c = e and e.lpos or P(1, 0, 0, 0)
+        local a = math.rad(i * 67)
+        sndAt(pick(WHISPERS), c + Vector(math.cos(a) * 100, math.sin(a) * 100, 52), 62, math.random(88, 104), 0.9)
+        wait(0.5)
+    end
+    -- something small runs along the wall
+    for i = 1, 6 do
+        sndAt(pick(FAST_STEPS), P(1, -150 + i * 55, -120, 6), 76, 112, 0.9)
+        wait(0.11)
+    end
+    wait(0.9)
+    sndAt("vo/ravenholm/madlaugh03.wav", gapPos(1, 60) + Vector(170, 0, 0), 70, 78, 0.6)
+    wait(1.7)
+    -- half a second of light: someone is standing by the next door
+    actorPlace(E.glimpse, P(1, 150, 142, 0), 180)
+    actorShow(E.glimpse, true)
+    wait(0.15)
+    lampSet(1, { mode = MODE.STROBE, col = { 220, 230, 255 }, level = 1.4 })
+    sndAt("music/stingers/hl1_stinger_song28.mp3", P(1, 150, 142, 50), 90, 100, 1)
+    wait(0.45)
+    lampSet(1, { mode = MODE.OFF })
+    actorShow(E.glimpse, false)
+    wait(1.8)
+    lampSet(1, { mode = MODE.PULSE, col = { 255, 70, 50 }, level = 0.7 })
+    sub("The door is sealed. The only way out is through.", 4.5)
+    wait(1.2)
+    objective("Find the way out of Ward 13")
+    tension(0.25)
+    doorOpen(1)
+end
+
+-- 2. DAY ROOM - the broadcast ---------------------------------------------
+EVENTS[2] = function()
+    wait(1.2)
+    local radioOff = false
+    loopStart("radio", E.radio or E.tv, "ambient/gas/steam_loop1.wav", 0.35, 150, 70)
+    sndAt("buttons/lightswitch2.wav", SPOT.radio, 75, 100, 1)
+    objective("Silence the radio")
+    intSet(INT.RADIO, true, function() radioOff = true end)
+    local nextChatter = 0
+    waitUntil(function()
+        if now >= nextChatter then
+            nextChatter = now + math.rand(1.6, 3.2)
+            sndAt(string.format("ambient/levels/prison/radio_random%d.wav", math.random(1, 15)), SPOT.radio, 72, math.random(78, 96), 0.9)
+        end
+        return radioOff
+    end, CONFIG.FAILSAFE * 0.4)
+    intSet(INT.RADIO, false)
+    loopStop("radio")
+    sndAt("buttons/lightswitch2.wav", SPOT.radio, 75, 90, 1)
+    objective("")
+    wait(2.8)
+
+    -- the television wakes up on its own
+    lampSet(2, { mode = MODE.OFF })
+    sndAt(pick(ZAPS), SPOT.tv, 88, 100, 1)
+    lampSet(11, { mode = MODE.FLICKER, level = 1.4 })
+    fx(nil, FX.TV, 1, "")
+    loopStart("tv", E.tv, "ambient/gas/steam_loop1.wav", 0.7, 190, 78)
+    loopStart("tvhum", E.tv, "ambient/energy/electric_loop.wav", 0.5, 100, 72)
+    tension(0.6)
+    wait(2.6)
+    fx(nil, FX.TV, 2, "I SEE YOU")
+    sndAt(pick(WHISPERS), SPOT.tv, 70, 80, 1)
+    wait(2.4)
+    fx(nil, FX.TV, 2, "BEHIND YOU")
+    objective("Switch off the TV")
+    local tvOff = false
+    intSet(INT.TV, true, function() tvOff = true end)
+    waitUntil(function() return tvOff end, CONFIG.FAILSAFE * 0.4)
+    intSet(INT.TV, false)
+    loopStop("tv")
+    loopStop("tvhum")
+    fx(nil, FX.TV, 0, "")
+    lampSet(11, { mode = MODE.OFF })
+    sndAt("buttons/lightswitch2.wav", SPOT.tv, 75, 80, 1)
+    objective("")
+    wait(1.6)
+
+    -- it is standing behind whoever is closest to the set
+    local W = E.watcher
+    local e = nearest(SPOT.tv, crowd(2))
+    local spot = P(2, -40, 40, 0)
+    if e then
+        local aim = aimOf(e)
+        local back = Vector(-aim.x, -aim.y, 0)
+        if back:getLength() > 0.1 then back = back / back:getLength() else back = Vector(-1, 0, 0) end
+        spot = clampInto(2, Vector(e.lpos.x, e.lpos.y, 0) + back * 105, 26)
+        actorPlace(W, spot, yawTo(spot, e.lpos))
+    else
+        actorPlace(W, spot, 0)
+    end
+    actorShow(W, true)
+    loopStart("breath", W and W.h, "npc/stalker/breathing3.wav", 0.9, 90, 75)
+    lampSet(2, { mode = MODE.DYING, level = 1.2 })
+    tension(0.85)
+    local seenAt
+    waitUntil(function()
+        if not seenAt then
+            for _, p in ipairs(crowd(2)) do
+                if sees(p, spot + Vector(0, 0, 55), 0.82) then seenAt = now break end
+            end
+        end
+        return seenAt ~= nil and now - seenAt > 0.7
+    end, 9)
+    loopStop("breath")
+    sndAt("npc/stalker/go_alert2a.wav", spot + Vector(0, 0, 55), 100, 95, 1)
+    lampSet(2, { mode = MODE.STROBE, col = { 230, 240, 255 }, level = 1.5 })
+    fx(plysOf(crowd(2)), FX.SHAKE, 9, 18, 0.8)
+    fx(plysOf(crowd(2)), FX.FLASH, 255, 255, 255, 60, 0.4)
+    wait(0.55)
+    actorShow(W, false)
+    lampSet(2, { mode = MODE.OFF })
+    wait(1.5)
+    lampDefault(2)
+    tension(0.3)
+    doorOpen(2)
+end
+
+-- 3. BURN WARD - they only move when nobody is looking --------------------
+local function twitch(m)
+    if not m.head then
+        local ok, id = pcall(m.h.lookupBone, m.h, "ValveBiped.Bip01_Head1")
+        m.head = (ok and id and id >= 0) and id or -1
+    end
+    if m.head >= 0 then
+        pcall(m.h.manipulateBoneAngles, m.h, m.head, Angle(math.random(-25, 25), math.random(-30, 30), math.random(-35, 35)))
+    end
+end
+
+EVENTS[3] = function()
+    local limit = now + CONFIG.FAILSAFE
+    local pulled = false
+    objective("Pull the lever on the far wall")
+    sub("They only move when no one is watching.", 4.5)
+    intSet(INT.LEVER, true, function() pulled = true end)
+    tension(0.5)
+    local nextDark, darkUntil = now + math.rand(7, 10), 0
+
+    while not pulled and now < limit do
+        local dark = now < darkUntil
+        if not dark and darkUntil > 0 then
+            darkUntil = 0
+            lampDefault(3)
+        elseif not dark and now >= nextDark then
+            -- the lights cut out, and in the dark nobody is watching anything
+            nextDark = now + math.rand(9, 13)
+            darkUntil = now + 1.3
+            dark = true
+            lampSet(3, { mode = MODE.OFF })
+            sndAt(pick(ZAPS), LAMPS[3].pos, 80, 90, 1)
+        end
+
+        local watchers, prey = crowd(2, 4), crowd(3)
+        for _, m in ipairs(E.mannequins) do
+            local target = alive(m) and nearest(m.pos, prey)
+            if target then
+                local watched = false
+                if not dark then
+                    for _, w in ipairs(watchers) do
+                        if sees(w, m.pos + Vector(0, 0, 50), 0.55) then watched = true break end
+                    end
+                end
+                if not watched then
+                    local d = Vector(target.lpos.x - m.pos.x, target.lpos.y - m.pos.y, 0)
+                    local dist = d:getLength()
+                    if dist < 48 then
+                        -- it reached someone
+                        sndOn(m.h, "npc/stalker/go_alert2a.wav", 100, 110, 1)
+                        scare(target, 2, 0.8)
+                        lampSet(3, { mode = MODE.OFF })
+                        wait(1.6)
+                        for _, mm in ipairs(E.mannequins) do actorPlace(mm, mm.home, mm.homeYaw) end
+                        lampDefault(3)
+                        nextDark, darkUntil = now + math.rand(8, 11), 0
+                        break
+                    end
+                    local step = math.min(dark and 46 or 24, dist - 40)
+                    actorPlace(m, m.pos + d * (step / dist), yawTo(m.pos, target.lpos))
+                    sndOn(m.h, pick(SCRAPES), 68, math.random(60, 80), 0.7)
+                    twitch(m)
+                end
+            end
+        end
+        wait(dark and 0.3 or 0.24)
+    end
+
+    intSet(INT.LEVER, false)
+    objective("")
+    if E.lever3 then spawnTask("lever", function() leverThrow(E.lever3) end) end
+    sndAt("buttons/lever7.wav", SPOT.lever, 80, 90, 1)
+    wait(0.3)
+    lampSet(3, { mode = MODE.OFF })
+    sndAt("ambient/machines/spindown.wav", LAMPS[3].pos, 80, 110, 0.9)
+    wait(1.4)
+    -- when the light comes back they are all standing around whoever pulled it
+    local e = nearest(SPOT.lever, crowd(3))
+    if e then
+        local n = #E.mannequins
+        for i, m in ipairs(E.mannequins) do
+            local a = math.rad(110 + (i - 1) * (140 / math.max(n - 1, 1)))
+            local p = clampInto(3, Vector(e.lpos.x + math.cos(a) * 62, e.lpos.y + math.sin(a) * 62, 0), 18)
+            actorPlace(m, p, yawTo(p, e.lpos))
+        end
+    end
+    lampSet(3, { mode = MODE.FLICKER, col = { 255, 60, 40 }, level = 1.0 })
+    sndAt("music/stingers/hl1_stinger_song8.mp3", SPOT.lever, 90, 100, 1)
+    fx(plysOf(crowd(3)), FX.SHAKE, 6, 14, 0.6)
+    sub("...they have stopped. For now.", 3.5)
+    wait(1.6)
+    tension(0.3)
+    doorOpen(3)
+end
+
+-- 4. NURSERY - the lullaby ------------------------------------------------
+local function dollPlace(d, lpos, lang)
+    setLocal(d.h, lpos, lang or d.ang)
+end
+
+EVENTS[4] = function()
+    loopStart("kids", E.carousel or E.musicbox, "ambient/voices/playground_memory.wav", 0.25, 100, 70)
+    objective("Wind the music box")
+    local wound = false
+    intSet(INT.MUSICBOX, true, function() wound = true end)
+    waitUntil(function() return wound end, CONFIG.FAILSAFE * 0.5)
+    intSet(INT.MUSICBOX, false)
+    objective("")
+    for i = 1, 3 do
+        sndAt("buttons/lever1.wav", SPOT.musicbox, 70, 150 + i * 12, 0.8)
+        wait(0.28)
+    end
+    loopStart("lullaby", E.musicbox, "ambient/creatures/teddy.wav", 1, 100, 75)
+    if E.ballerina then pcall(E.ballerina.setAngVel, E.ballerina, Angle(0, 120, 0)) end
+    lampSet(4, { mode = MODE.PULSE, level = 0.75 })
+    loopTune("kids", 0.5, nil, 2)
+    tension(0.45)
+
+    -- while it plays, every doll in the room lifts off the floor and slowly turns
+    local t0 = now
+    local phase = {}
+    for i = 1, #E.dolls do phase[i] = math.rand(0, 6.28) end
+    local slowed = false
+    while now - t0 < 13 do
+        local t = now - t0
+        local rise = clamp(t / 6, 0, 1)
+        rise = rise * rise * (3 - 2 * rise)
+        local shake = t > 9
+        for i, d in ipairs(E.dolls) do
+            local jit = shake and math.rand(-2.5, 2.5) or 0
+            local z = lerp(d.home.z, 58, rise) + math.sin(t * 1.3 + phase[i]) * 3 * rise
+            dollPlace(d, Vector(d.home.x + jit, d.home.y - jit, z),
+                Angle(shake and math.rand(-14, 14) or 0, d.ang.y + t * 40, shake and math.rand(-14, 14) or 0))
+        end
+        if t > 8 and not slowed then
+            slowed = true
+            loopTune("lullaby", nil, 55, 4.5)     -- the tune winds down
+            lampSet(4, { mode = MODE.FLICKER, level = 0.7 })
+            tension(0.7)
+        end
+        wait(0.05)
+    end
+
+    loopStop("lullaby")
+    loopStop("kids")
+    if E.ballerina then pcall(E.ballerina.setAngVel, E.ballerina, Angle(0, 0, 0)) end
+    lampSet(4, { mode = MODE.OFF })
+    sndAt("ambient/creatures/town_child_scream1.wav", P(4, 0, 0, 50), 95, 100, 1)
+    for _, d in ipairs(E.dolls) do dollPlace(d, Vector(d.home.x, d.home.y, 2)) end
+    sndAt("physics/plastic/plastic_box_impact_soft1.wav", P(4, 0, 0, 5), 80, 90, 1)
+    wait(0.6)
+    -- small feet, everywhere, in the dark
+    for i = 1, 14 do
+        sndAt(pick(FAST_STEPS), P(4, math.random(-150, 150), math.random(-150, 150), 4), 70, math.random(150, 180), 0.8)
+        wait(0.1)
+    end
+    wait(0.5)
+    -- the light returns and they are sitting in a ring around you
+    local e = nearest(SPOT.musicbox, crowd(4))
+    local c = clampInto(4, e and e.lpos or P(4, 0, 0, 0), 72)
+    local n = math.max(#E.dolls, 1)
+    for i, d in ipairs(E.dolls) do
+        local a = (i - 1) * (360 / n)
+        dollPlace(d, Vector(c.x + math.cos(math.rad(a)) * 54, c.y + math.sin(math.rad(a)) * 54, 2), Angle(0, a + 180, 0))
+    end
+    lampSet(4, { mode = MODE.DYING, col = { 255, 60, 80 }, level = 1.5 })
+    sndAt("music/stingers/hl1_stinger_song16.mp3", Vector(c.x, c.y, 40), 90, 100, 1)
+    fx(plysOf(crowd(4)), FX.SHAKE, 5, 12, 0.6)
+    tension(0.8)
+    wait(2.6)
+    sndAt("vo/ravenholm/madlaugh04.wav", Vector(c.x, c.y, 30), 80, 190, 0.9)
+    lampSet(4, { mode = MODE.FLICKER, col = { 255, 120, 120 }, level = 0.8 })
+    sub("They only want someone to play with.", 4)
+    wait(1.6)
+    tension(0.3)
+    doorOpen(4)
+end
+
+-- 5. COLD STORAGE - the butcher -------------------------------------------
+-- Hanging bodies swing when somebody brushes past them (runs every tick).
+local function updateBodies()
+    if not E.bodies then return end
+    local prey = occ(5)
+    for _, b in ipairs(E.bodies) do
+        if isValid(b.h) then
+            local t = now - b.t0
+            if t > 2.2 then
+                for _, e in ipairs(prey) do
+                    local dx, dy = e.lpos.x - b.pivot.x, e.lpos.y - b.pivot.y
+                    if dx * dx + dy * dy < 34 * 34 then
+                        b.t0, b.amp, t = now, 18 + math.random(0, 10), 0
+                        sndOn(b.h, pick(CHAINS), 70, math.random(85, 110), 0.8)
+                        break
+                    end
+                end
+            end
+            if t < 7 then
+                b.h:setAngles(angToWorld(Angle(180 + b.amp * math.exp(-t / 1.7) * math.sin(t * 4.4), b.yaw, 0)))
+                b.moving = true
+            elseif b.moving then
+                b.moving = false
+                b.h:setAngles(angToWorld(Angle(180, b.yaw, 0)))
+            end
+        end
+    end
+end
+
+local function swingAll(amp)
+    for _, b in ipairs(E.bodies or {}) do
+        b.t0, b.amp = now - math.rand(0, 0.5), amp + math.random(-4, 4)
+    end
+end
+
+EVENTS[5] = function()
+    local B = E.butcher
+    loopStart("flies", E.bodies[2] and E.bodies[2].h, "ambient/creatures/flies1.wav", 0.6, 100, 70)
+    objective("Throw the breaker")
+    sub("Cold storage. The power for the next door runs through here.", 4.5)
+    local thrown = false
+    intSet(INT.BREAKER, true, function() thrown = true end)
+    tension(0.45)
+    waitUntil(function() return thrown end, CONFIG.FAILSAFE * 0.5)
+    intSet(INT.BREAKER, false)
+    objective("")
+    if E.breaker then spawnTask("lever", function() leverThrow(E.breaker) end) end
+    sndAt("buttons/lever8.wav", SPOT.breaker, 80, 90, 1)
+    wait(0.35)
+    sndAt("ambient/machines/spindown.wav", LAMPS[5].pos, 85, 100, 1)
+    lampSet(5, { mode = MODE.OFF })
+    loopStop("flies", 1)
+    tension(0.75)
+    wait(1.3)
+
+    -- one of them comes down right beside whoever threw it
+    local e = nearest(SPOT.breaker, crowd(5))
+    local drop = clampInto(5, e and (e.lpos + Vector(-40, -34, 0)) or P(5, 20, 120, 0), 30)
+    actorPlace(E.dropBody, Vector(drop.x, drop.y, 9), 0, Angle(-90, math.random(0, 359), 0))
+    actorShow(E.dropBody, true)
+    sndAt(pick(CHAINS), drop + Vector(0, 0, 120), 85, 80, 1)
+    sndAt("physics/body/body_medium_impact_hard1.wav", drop, 90, 85, 1)
+    fx(plysOf(crowd(5)), FX.SHAKE, 5, 10, 0.5)
+    swingAll(24)
+    wait(1.6)
+    loopStart("drag", E.dropBody and E.dropBody.h, "physics/flesh/flesh_scrape_rough_loop.wav", 0.8, 80, 78)
+    wait(1.9)
+
+    -- red light: he is standing in the doorway you came in through
+    loopStop("drag")
+    actorPlace(B, P(5, -160, -142, 0), 0)
+    actorShow(B, true)
+    actorAnim(B, { "Idle01", "idle01", "idle" }, 1)
+    lampSet(5, { mode = MODE.PULSE, col = { 255, 30, 20 }, level = 1.2 })
+    sndOn(B and B.h, "npc/zombie_poison/pz_alert1.wav", 95, 85, 1)
+    tension(1)
+    wait(1.9)
+
+    -- and then he runs
+    lampSet(5, { mode = MODE.STROBE, col = { 255, 30, 20 }, level = 1.5 })
+    sndOn(B and B.h, "npc/zombie_poison/pz_call1.wav", 100, 90, 1)
+    actorAnim(B, { "Run", "run", "FireWalk", "Walk", "walk" }, 1.6)
+    local victim
+    if alive(B) then
+        local chaseEnd, nextStep = now + 4, 0
+        while now < chaseEnd do
+            local target = nearest(B.pos, crowd(4, 6))
+            if not target then break end
+            local d = Vector(target.lpos.x - B.pos.x, target.lpos.y - B.pos.y, 0)
+            local dist = d:getLength()
+            if dist < 52 then victim = target break end
+            local move = math.min(dist, 430 * dt)
+            actorPlace(B, B.pos + d * (move / dist), yawTo(B.pos, target.lpos))
+            if now >= nextStep then
+                nextStep = now + 0.17
+                sndOn(B.h, pick(HEAVY_STEPS), 85, 110, 1)
+            end
+            wait(0)
+        end
+    end
+    if victim then
+        sndOn(B.h, "npc/fast_zombie/fz_scream1.wav", 100, 80, 1)
+        scare(victim, 6, 0.8)
+    end
+    wait(0.15)
+    lampSet(5, { mode = MODE.OFF })
+    actorShow(B, false)
+    wait(1.5)
+    lampDefault(5)
+    swingAll(13)
+    sub("He is still in here somewhere.", 3.5)
+    tension(0.35)
+    doorOpen(5)
+end
+
+-- 6. CHAPEL - the seance ---------------------------------------------------
+EVENTS[6] = function()
+    local S = E.summoned
+    local lit = 0
+    objective("Light the five candles")
+    sub("Somebody left a ritual unfinished.", 4)
+    loopStart("chant", E.altar, "ambient/levels/citadel/citadel_ambient_voices1.wav", 0.25, 80, 72)
+    tension(0.35)
+    for i = 1, 5 do
+        intSet(5 + i, true, function()
+            local c = E.candles[i]
+            if not c or c.lit then return end
+            c.lit = true
+            lit = lit + 1
+            intSet(5 + i, false)
+            if isValid(c.flame) then
+                c.flame:setColor(Color(255, 170, 60))
+                c.flame:setNoDraw(false)
+            end
+            lampSet(11 + i, { mode = MODE.CANDLE, col = { 255, 150, 60 }, level = 1.0 })
+            lampSet(6, { mode = MODE.CANDLE, col = { 255, 150, 70 }, level = 0.35 + lit * 0.17 })
+            sndAt("ambient/fire/mtov_flame2.wav", CANDLES[i], 72, 140, 0.7)
+            sndAt(pick(WHISPERS), SPOT.circle + Vector(0, 0, 40), 60 + lit * 4, 90 - lit * 5, 1)
+            loopTune("chant", 0.25 + lit * 0.12, nil, 1)
+            tension(0.35 + lit * 0.1)
+        end)
+    end
+    -- with no candles to light (build ran out of holograms) the rite simply times out
+    waitUntil(function() return lit >= 5 end, #E.candles >= 5 and CONFIG.FAILSAFE or 8)
+    for i = 1, 5 do intSet(5 + i, false) end
+    objective("")
+    wait(1.4)
+
+    -- the flames turn red and the floor answers
+    lampSet(6, { mode = MODE.PULSE, col = { 255, 20, 10 }, level = 1.3 })
+    for i, c in ipairs(E.candles) do
+        lampSet(11 + i, { mode = MODE.CANDLE, col = { 255, 40, 20 }, level = 1.4 })
+        if isValid(c.flame) then c.flame:setColor(Color(255, 40, 20)) end
+    end
+    loopStart("rumble", E.altar, "ambient/atmosphere/terrain_rumble1.wav", 1, 80, 85)
+    fx(plysOf(crowd(6)), FX.SHAKE, 4, 9, 6)
+    sndAt(pick(VORT), SPOT.circle + Vector(0, 0, 60), 90, 55, 1)
+    tension(0.9)
+
+    -- the skulls lift and circle while it climbs out of the star
+    actorPlace(S, SPOT.circle + Vector(0, 0, -125), 180)
+    actorShow(S, true)
+    loopStart("sbreath", S and S.h, "npc/stalker/breathing3.wav", 1, 70, 85)
+    local t0, rise, chantAt = now, 5.2, now + 1.8
+    while now - t0 < rise do
+        local t = now - t0
+        local f = t / rise
+        local target = nearest(SPOT.circle, crowd(6))
+        actorPlace(S, SPOT.circle + Vector(0, 0, lerp(-125, 0, f * f * (3 - 2 * f))), target and yawTo(SPOT.circle, target.lpos) or 180)
+        for i, c in ipairs(E.candles) do
+            local a = 90 + 72 * (i - 1) + t * 70
+            local z = 4 + 50 * clamp(t / 2, 0, 1) + math.sin(t * 3 + i) * 5
+            setLocal(c.skull, SPOT.circle + Vector(math.cos(math.rad(a)) * 92, math.sin(math.rad(a)) * 92, z), Angle(0, a + 180, 0))
+        end
+        if now >= chantAt then
+            chantAt = now + 1.7
+            sndAt(pick(VORT), SPOT.circle + Vector(0, 0, 70), 88, 50, 1)
+        end
+        wait(0.03)
+    end
+    wait(0.5)
+
+    -- it screams and comes for whoever is nearest
+    loopStop("sbreath")
+    sndOn(S and S.h, "npc/stalker/go_alert2a.wav", 105, 70, 1)
+    lampSet(6, { mode = MODE.STROBE, col = { 255, 20, 10 }, level = 1.8 })
+    local victim = nearest(SPOT.circle, crowd(6))
+    if victim and alive(S) then
+        local from, t1 = S.pos, now
+        while now - t1 < 0.32 do
+            local f = (now - t1) / 0.32 * 0.85
+            local to = victim.lpos
+            actorPlace(S, Vector(lerp(from.x, to.x, f), lerp(from.y, to.y, f), 0), yawTo(from, to))
+            wait(0)
+        end
+    end
+    scare(victim, 4, 0.85)
+    wait(0.25)
+
+    -- and everything goes out at once
+    sndAt("ambient/atmosphere/thunder1.wav", SPOT.circle + Vector(0, 0, 100), 100, 100, 1)
+    actorShow(S, false)
+    loopStop("rumble", 1.5)
+    loopStop("chant", 0.5)
+    lampSet(6, { mode = MODE.OFF })
+    for i, c in ipairs(E.candles) do
+        lampSet(11 + i, { mode = MODE.OFF })
+        if isValid(c.flame) then c.flame:setNoDraw(true) end
+        setLocal(c.skull, c.home, c.hang)
+    end
+    sndAt("physics/concrete/rock_impact_hard1.wav", SPOT.circle, 82, 120, 1)
+    fx(plysOf(crowd(6)), FX.FLASH, 255, 255, 255, 90, 0.6)
+    wait(2.4)
+    lampDefault(6)
+    sub("The circle is cold. Whatever answered is not inside it anymore.", 4.5)
+    tension(0.35)
+    doorOpen(6)
+end
+
+-- 7. ISOLATION - the cell block --------------------------------------------
+EVENTS[7] = function()
+    local A, Bf, C = E.inmate, E.sobber, E.escapee
+    local cx, cy = chamberCenter(7)
+    local limit = now + CONFIG.FAILSAFE
+    local function left() return math.max(limit - now, 0.1) end
+    loopStart("cells", E.cellAnchor, "ambient/atmosphere/quiet_cellblock_amb.wav", 0.7, 100, 75)
+    objective("Walk the cell block")
+    tension(0.45)
+
+    actorPlace(A, P(7, 150, 165, 0), 90)
+    actorShow(A, true)
+    actorAnim(A, { "Idle01", "idle01" }, 0.6)
+    actorPlace(Bf, P(7, 30, 168, 0), 100)
+    actorShow(Bf, true)
+
+    -- how far down the corridor has anyone come (smaller = further)
+    local function front()
+        local best
+        for _, e in ipairs(occ(7)) do
+            local dx = e.lpos.x - cx
+            if not best or dx < best then best = dx end
+        end
+        return best
+    end
+    local sobAt = 0
+    local function sob()
+        if now >= sobAt then
+            sobAt = now + math.rand(2.5, 4)
+            sndOn(Bf and Bf.h, pick(SOBS), 72, 100, 0.9)
+        end
+    end
+
+    -- first cell: he was facing the wall
+    waitUntil(function() sob() local f = front() return f ~= nil and f < 150 end, left())
+    local e = nearest(P(7, 150, -60, 0), occ(7))
+    local sx = clamp(e and (e.lpos.x - cx) or 140, 108, 178)
+    actorPlace(A, P(7, sx, 26, 0), -90)
+    actorAnim(A, { "attackA", "attackB", "swatleftmid", "Idle01" }, 1.4)
+    sndOn(A and A.h, "npc/zombie/zombie_alert2.wav", 100, 100, 1)
+    sndAt(pick(GRATES), P(7, sx, 10, 60), 100, 90, 1)
+    lampSet(7, { mode = MODE.STROBE, level = 1.3 })
+    fx(plysOf(occ(7)), FX.SHAKE, 8, 16, 0.6)
+    tension(0.8)
+    spawnTask("rattle", function()
+        for i = 1, 5 do
+            wait(0.35)
+            sndAt(pick(GRATES), P(7, sx, 10, 60), 88, math.random(85, 110), 0.9)
+        end
+    end)
+    wait(0.7)
+    lampDefault(7)
+    wait(1.0)
+
+    -- second cell: the crying stops, and she turns to watch
+    waitUntil(function() sob() local f = front() return f ~= nil and f < 78 end, left())
+    sndOn(Bf and Bf.h, "ambient/creatures/town_scared_breathing1.wav", 70, 100, 0.8)
+    sub("The crying has stopped.", 2.5)
+    local turnEnd = now + 3
+    while now < turnEnd and alive(Bf) do
+        local t = nearest(Bf.pos, occ(7))
+        if t then
+            actorPlace(Bf, Bf.pos, math.approachAngle(Bf.yaw, yawTo(Bf.pos, t.lpos), 4))
+        end
+        wait(0.05)
+    end
+
+    -- third cell is empty; by now she is standing at her bars
+    waitUntil(function() local f = front() return f ~= nil and f < -10 end, left())
+    actorPlace(Bf, P(7, 48, 24, 0), -90)
+    sndAt(pick(GRATES), P(7, 48, 10, 60), 74, 130, 0.5)
+
+    -- the passage to the door
+    waitUntil(function()
+        for _, p in ipairs(occ(7)) do
+            if p.lpos.x - cx < -105 and p.lpos.y - cy > -70 then return true end
+        end
+        return false
+    end, left())
+    lampSet(7, { mode = MODE.OFF })
+    sndAt(pick(ZAPS), LAMPS[7].pos, 80, 90, 1)
+    loopStop("cells", 0.5)
+    tension(0.9)
+    wait(1.0)
+    actorPlace(C, P(7, -150, 150, 0), -90)
+    actorShow(C, true)
+    actorAnim(C, { "idle", "Idle01", "idle_angry" }, 1)
+    loopStart("cbreath", C and C.h, "npc/fast_zombie/breathe_loop1.wav", 1, 100, 80)
+    wait(1.3)
+    lampSet(7, { mode = MODE.DYING, level = 1.3 })
+    wait(2.4)
+
+    -- it rushes whoever is closest, and then it is simply gone
+    local victim = alive(C) and nearest(C.pos, occ(7)) or nil
+    sndOn(C and C.h, "npc/fast_zombie/fz_scream1.wav", 100, 100, 1)
+    lampSet(7, { mode = MODE.STROBE, level = 1.5 })
+    if victim then
+        actorAnim(C, { "Run", "run", "leap" }, 1.5)
+        local goal = Vector(victim.lpos.x, victim.lpos.y, 0)
+        actorWalk(C, goal, 520, FAST_STEPS, 0.12, function() return C.pos:getDistance(victim.lpos) < 50 end)
+        scare(victim, 3, 0.75)
+    end
+    loopStop("cbreath")
+    wait(0.15)
+    lampSet(7, { mode = MODE.OFF })
+    actorShow(C, false)
+    wait(1.5)
+    lampDefault(7)
+    sub("One got out.", 3)
+    objective("")
+    tension(0.35)
+    doorOpen(7)
+end
+
+-- 8. HYDROTHERAPY - the tub -------------------------------------------------
+EVENTS[8] = function()
+    local T = E.torso
+    local def = INTERACT[INT.TUB]
+    local top = E.tubTop or 24
+    local surface = SPOT.tub + Vector(0, 0, top * 0.8)
+    loopStart("drip", E.tub or E.water, "ambient/water/drip_loop1.wav", 0.6, 100, 70)
+    objective("The key is at the bottom of the tub")
+    sub("Something metal glints under the surface.", 4)
+    tension(0.4)
+    intSet(INT.TUB, true)
+
+    local limit = now + CONFIG.FAILSAFE
+    local progress, holder, grabbed = 0, nil, nil
+    local splashAt, sentTension = 0, 0.4
+    while now < limit do
+        local who
+        for _, e in ipairs(occ(8)) do
+            if e.ply:keyDown(IN_KEY.USE) and eyeOf(e):getDistance(def.pos) < def.radius then who = e break end
+        end
+        if who then
+            if holder ~= who then holder, progress = who, 0 end
+            progress = progress + 0.05
+            if now >= splashAt then
+                splashAt = now + 0.7
+                sndAt(pick(SPLASH), surface, 70, math.random(90, 110), 0.5)
+            end
+            local want = 0.5 + 0.5 * progress / def.hold
+            if want - sentTension > 0.12 then sentTension = want tension(want) end
+            if progress >= def.hold then grabbed = who break end
+        elseif holder then
+            -- they pulled their arm back out
+            holder, progress, sentTension = nil, 0, 0.5
+            sndAt("ambient/water/water_splash2.wav", surface, 75, 120, 0.7)
+            sub("Something brushed your hand.", 2.5)
+            tension(0.5)
+        end
+        wait(0.05)
+    end
+    intSet(INT.TUB, false)
+    objective("")
+
+    -- it was holding the key
+    local face = grabbed and yawTo(SPOT.tub, grabbed.lpos) or 0
+    actorPlace(T, SPOT.tub + Vector(0, 0, -22), face)
+    actorShow(T, true)
+    actorAnim(T, { "attack", "crawl", "Idle01" }, 1.5)
+    sndAt("ambient/water/water_splash3.wav", surface, 95, 90, 1)
+    sndOn(T and T.h, "npc/zombie/zombie_alert3.wav", 100, 105, 1)
+    pcall(effect.create, "watersplash", { origin = toWorld(surface), scale = 8 })
+    lampSet(8, { mode = MODE.STROBE, level = 1.5 })
+    local t0 = now
+    while now - t0 < 0.22 do
+        actorPlace(T, SPOT.tub + Vector(0, 0, lerp(-22, top * 0.6, (now - t0) / 0.22)), face)
+        wait(0)
+    end
+    scare(grabbed, 5, 0.8)
+    fx(plysOf(occ(8)), FX.SHAKE, 10, 18, 0.8)
+    tension(1)
+    wait(0.9)
+    lampSet(8, { mode = MODE.OFF })
+    actorShow(T, false)
+    sndAt("ambient/water/water_splash1.wav", surface, 80, 80, 0.8)
+    wait(1.7)
+    lampDefault(8)
+    sndAt("doors/latchunlocked1.wav", gapPos(8, 50), 80, 100, 1)
+    sub("You have the key. Something else nearly had you.", 4)
+    tension(0.35)
+    doorOpen(8)
+end
+
+-- 9. STAFF ROOM - hide --------------------------------------------------------
+EVENTS[9] = function()
+    local W = E.warden
+    local cx, cy = chamberCenter(9)
+    local function hidden(e)
+        if e.lpos.x - cx > -98 or e.lpos.y - cy > -83 then return false end
+        if e.ply:getVelocity():getLength() > 28 then return false end
+        if e.ply:isFlashlightOn() then return false end
+        return true
+    end
+    local path = {
+        P(9, -150, 142, 0), P(9, -20, 60, 0), P(9, -56, -110, 0), P(9, 60, -120, 0),
+        P(9, 150, -30, 0), P(9, 0, 70, 0), P(9, -150, 142, 0), P(9, -240, 142, 0),
+    }
+    local attempts, survived = 0, false
+
+    while not survived and attempts < 3 do
+        attempts = attempts + 1
+        objective("Hide in the nook. Stand still. Flashlight off.")
+        sub(attempts == 1 and "Something heavy is coming. Get in the nook. Don't move. Kill your light." or "It is coming back.", 5)
+        lampSet(9, { mode = MODE.PULSE, col = { 255, 60, 40 }, level = 0.8 })
+        tension(0.7)
+        -- footsteps and fists on the far door
+        for i = 1, 7 do
+            sndAt(pick(HEAVY_STEPS), gapPos(9, 10) + Vector(-(270 - i * 30), 0, 0), 85, 70, 0.6 + i * 0.05)
+            if i == 4 or i == 6 then
+                sndAt("npc/zombie/zombie_pound_door.wav", gapPos(9, 60), 95, 90, 1)
+                fx(plysOf(occ(9)), FX.SHAKE, 4, 10, 0.4)
+            end
+            wait(1.0)
+        end
+        doorOpen(9, 0.5)
+        actorPlace(W, P(9, -240, 142, 0), 0)
+        actorShow(W, true)
+        actorAnim(W, { "walk", "Walk", "walk_all" }, 0.8)
+        loopStart("wbreath", W and W.h, "npc/zombie_poison/pz_breathe_loop1.wav", 1, 80, 85)
+        lampSet(9, { mode = MODE.DYING, col = { 255, 190, 120 }, level = 1.1 })
+        tension(1)
+
+        local caught
+        local exposed = {}
+        local function watch()
+            for _, e in ipairs(occ(9)) do
+                if hidden(e) then
+                    exposed[e] = 0
+                else
+                    exposed[e] = (exposed[e] or 0) + dt
+                    if exposed[e] > 0.7 then caught = e return true end
+                end
+            end
+            return false
+        end
+
+        if alive(W) then
+            for i, wp in ipairs(path) do
+                if actorWalk(W, wp, 95, HEAVY_STEPS, 0.62, watch) then break end
+                if i == 3 then
+                    -- it stops right outside the nook and listens
+                    actorPlace(W, W.pos, yawTo(W.pos, SPOT.nook))
+                    sndOn(W.h, "npc/zombie_poison/pz_warn1.wav", 80, 80, 1)
+                    local till = now + 3.2
+                    while now < till and not watch() do wait(0) end
+                    if caught then break end
+                end
+            end
+        else
+            local till = now + 12
+            while now < till and not watch() do wait(0) end
+        end
+        loopStop("wbreath")
+
+        if caught then
+            sndOn(W and W.h, "npc/stalker/go_alert2a.wav", 105, 80, 1)
+            lampSet(9, { mode = MODE.STROBE, col = { 255, 40, 30 }, level = 1.6 })
+            if alive(W) then
+                local goal = Vector(caught.lpos.x, caught.lpos.y, 0)
+                actorWalk(W, goal, 560, HEAVY_STEPS, 0.14, function() return W.pos:getDistance(caught.lpos) < 52 end)
+            end
+            scare(caught, 4, 0.85)
+            wait(0.5)
+            lampSet(9, { mode = MODE.OFF })
+            actorShow(W, false)
+            slamDoor(9)
+            wait(2.4)
+        else
+            survived = true
+        end
+    end
+
+    actorShow(W, false)
+    lampDefault(9)
+    objective("")
+    sub(survived and "It has gone. Move." or "It lost interest. Move, before it changes its mind.", 4)
+    tension(0.4)
+    doorOpen(9)
+end
+
+-- 10. THE WAY OUT - run ---------------------------------------------------------
+EVENTS[10] = function()
+    local W = E.warden
+    local cx, cy = chamberCenter(10)
+    -- give them a few steps before it starts
+    waitUntil(function()
+        for _, e in ipairs(occ(10)) do
+            if e.lpos.y - cy < 70 then return true end
+        end
+        return false
+    end, 20)
+
+    loopStart("alarm", doors[10] and doors[10].ent, "ambient/alarms/alarm_citizen_loop1.wav", 0.8, 100, 85)
+    lampSet(10, { mode = MODE.ALARM, col = { 255, 20, 10 }, level = 1.4 })
+    lampSet(17, { mode = MODE.STEADY })
+    objective("RUN")
+    fx(plysOf(crowd(9, 10)), FX.TITLE, "RUN", "", 1.8)
+    tension(1)
+
+    local runners, escaped = {}, {}
+    for _, e in ipairs(crowd(9, 10)) do runners[e] = true end
+    local doorOpened = false
+
+    -- opens the exit for whoever reaches the last stretch and counts who is still inside
+    local function check()
+        local remaining = 0
+        for e in pairs(runners) do
+            if e.k == 10 and not doorOpened and e.lpos.x - cx < -70 then
+                doorOpened = true
+                doorOpen(10, 1.1)
+            end
+            if not escaped[e] and e.k == 0 and e.lpos.x < -16 then
+                escaped[e] = true
+                local t = { e.ply }
+                fx(t, FX.FLASH, 255, 255, 255, 90, 1.4)
+                fx(t, FX.TITLE, "YOU SURVIVED", "WARD 13", 7)
+            end
+            if not escaped[e] and e.k >= 1 then remaining = remaining + 1 end
+        end
+        return remaining
+    end
+
+    local route = {
+        P(10, 150, 142, 0), P(10, 126, -142, 0), P(10, 0, -142, 0), P(10, 0, 142, 0),
+        P(10, -126, 142, 0), P(10, -126, 0, 0), P(10, -185, 0, 0),
+    }
+    local limit = now + 45
+    while now < limit and check() > 0 do
+        local caught
+        if alive(W) then
+            actorPlace(W, P(10, 230, 142, 0), 180)
+            actorShow(W, true)
+            actorAnim(W, { "run", "Run", "walk", "Walk" }, 1.8)
+            sndOn(W.h, "npc/stalker/go_alert2a.wav", 105, 75, 1)
+            for _, wp in ipairs(route) do
+                local hit = actorWalk(W, wp, 285, HEAVY_STEPS, 0.2, function()
+                    if check() == 0 then return true end
+                    local e, d = nearest(W.pos, occ(10))
+                    if e and d < 54 then caught = e return true end
+                    return false
+                end)
+                if hit then break end
+            end
+        else
+            wait(0.5)
+        end
+        actorShow(W, false)
+        if caught then
+            scare(caught, 4, 0.8)
+            lampSet(10, { mode = MODE.OFF })
+            wait(2.2)
+            lampSet(10, { mode = MODE.ALARM, col = { 255, 20, 10 }, level = 1.4 })
+        else
+            wait(1.2)
+        end
+    end
+
+    actorShow(W, false)
+    loopStop("alarm", 1.5)
+    lampSet(17, { mode = MODE.OFF })
+    -- the door comes down behind them, and it reaches the other side a moment too late
+    slamDoor(10)
+    wait(0.5)
+    for i = 1, 3 do
+        sndAt("npc/zombie/zombie_pound_door.wav", gapPos(10, 60), 95, 85, 1)
+        local close = {}
+        for _, e in ipairs(occ(0)) do
+            if e.lpos:getDistance(gapPos(10)) < 500 then close[#close + 1] = e.ply end
+        end
+        fx(close, FX.SHAKE, 3, 10, 0.3)
+        wait(0.55)
+    end
+    sndAt("npc/stalker/go_alert2a.wav", gapPos(10, 60) + Vector(60, 0, 0), 85, 60, 0.7)
+    lampSet(10, { mode = MODE.OFF })
+    objective("")
+    tension(0)
+end
+
+---------------------------------------------------------------------------
+-- SERVER: run state, reset, main loop
+---------------------------------------------------------------------------
+local ev = {}
+local greeted = {}
+local finished, finishAt, emptySince = false, 0, nil
+
+local function resetRoom()
+    killTasks()
+    loopStopAll()
+    for k = 1, 10 do ev[k] = "idle" end
+    greeted = {}
+    finished, finishAt, emptySince = false, 0, nil
+    for id in pairs(LAMP_DEFAULT) do lampDefault(id) end
+    for id in pairs(INTERACT) do intSet(id, false) end
+    fx(nil, FX.OBJ, "")
+    fx(nil, FX.TENSION, 0)
+    fx(nil, FX.TV, 0, "")
+
+    -- only the entrance stands open
+    for i = 0, 10 do
+        local d = doors[i]
+        if d and isValid(d.ent) then
+            d.target = (i == 0) and 1 or 0
+            d.t = d.target
+            d.ent:setPos(d.closed + UP * (d.t * (H - 1)))
+        end
+    end
+
+    -- everything back on its mark; one stubborn entity must not stop the rest
+    for _, a in ipairs(actors) do pcall(actorShow, a, false) end
+    for _, m in ipairs(E.mannequins) do
+        pcall(actorPlace, m, m.home, m.homeYaw)
+        pcall(actorShow, m, true)
+    end
+    for _, d in ipairs(E.dolls) do pcall(dollPlace, d, d.home, d.ang) end
+    for _, c in ipairs(E.candles) do
+        c.lit = false
+        if isValid(c.flame) then pcall(c.flame.setNoDraw, c.flame, true) end
+        pcall(setLocal, c.skull, c.home, c.hang)
+    end
+    for _, b in ipairs(E.bodies) do
+        b.t0, b.moving = -100, false
+        if isValid(b.h) then pcall(b.h.setAngles, b.h, angToWorld(Angle(180, b.yaw, 0))) end
+    end
+    if E.lever3 then pcall(leverSet, E.lever3, 50) end
+    if E.breaker then pcall(leverSet, E.breaker, 50) end
+    if E.ballerina then pcall(E.ballerina.setAngVel, E.ballerina, Angle(0, 0, 0)) end
+end
+
+-- Distant, unexplained noises for as long as somebody is inside.
+local function ambientDaemon()
+    while true do
+        wait(math.rand(7, 16))
+        local inside = crowd(1, 10)
+        if ready and #inside > 0 then
+            local e = pick(inside)
+            local a = math.rad(math.random(0, 359))
+            local p = e.lpos + Vector(math.cos(a) * 260, math.sin(a) * 260, 60)
+            local roll = math.random(1, 10)
+            if roll <= 4 then
+                sndAt(pick(STRESS), p, 72, math.random(80, 105), 0.7)
+            elseif roll <= 7 then
+                sndAt(pick(CREAKS), p, 70, math.random(80, 100), 0.7)
+            elseif roll <= 9 then
+                sndAt(pick(BOOMS), p, 75, math.random(85, 100), 0.6)
+            else
+                sndAt(string.format("ambient/levels/prison/inside_battle_zombie%d.wav", math.random(1, 3)), p, 70, 100, 0.45)
+            end
+        end
+    end
+end
+
+local function eventTrigger(k)
+    if k == 1 then
+        for _, e in ipairs(occ(1)) do
+            if e.lpos.x > CELL * 0.45 then return true end
+        end
+        return false
+    end
+    return #occ(k) > 0
+end
+
+local function startEvent(k)
+    ev[k] = "active"
+    spawnTask("event " .. k, function()
+        EVENTS[k]()
+        ev[k] = "done"
+        if k == 10 then finished, finishAt = true, now + CONFIG.RESET_DELAY end
+    end, function()
+        -- a broken scene must never trap anyone
+        ev[k] = "done"
+        doorOpen(k)
+        if k == 10 then finished, finishAt = true, now + CONFIG.RESET_DELAY end
+    end)
+end
+
+hook.add("think", "ward13_main", function()
+    local t = timer.curtime()
+    dt = clamp(t - now, 0.001, 0.1)
+    now = t
+    refreshPlayers()
+
+    if ready then
+        if ev[1] == "idle" then
+            for _, e in ipairs(occ(1)) do
+                if not greeted[e] then
+                    greeted[e] = true
+                    fx({ e.ply }, FX.TITLE, "WARD 13", "No one leaves.", 4.5)
+                end
+            end
+        end
+        for k = 1, 10 do
+            if ev[k] == "idle" and (k == 1 or ev[k - 1] == "done") and eventTrigger(k) then startEvent(k) end
+        end
+        updateBodies()
+
+        local inside = #crowd(1, 10)
+        if finished then
+            if now >= finishAt and inside == 0 then resetRoom() end
+        elseif ev[1] ~= "idle" then
+            if inside == 0 then
+                emptySince = emptySince or now
+                if now - emptySince > CONFIG.IDLE_RESET then
+                    say("run abandoned - the ward is armed again.")
+                    resetRoom()
+                end
+            else
+                emptySince = nil
+            end
+        end
+    end
+
+    runTasks()
+    updateDoors()
+    flushNet()
+end)
+
+hook.add("KeyPress", "ward13_use", function(ply, key)
+    if key ~= IN_KEY.USE or not ready or not isValid(ply) then return end
+    local eye = toLocal(ply:getShootPos())
+    local aim = dirToLocal(ply:getAimVector())
+    local best, bestD
+    for id, s in pairs(intState) do
+        local def = INTERACT[id]
+        if s.active and s.handler and not def.hold then
+            local to = def.pos - eye
+            local d = to:getLength()
+            if d < def.radius and (d < 40 or aim:dot(to / d) > 0.35) and (not bestD or d < bestD) then
+                best, bestD = id, d
+            end
+        end
+    end
+    if best then
+        local ok, err = pcall(intState[best].handler, ply, best)
+        if not ok then say("interaction failed: " .. tostring(err)) end
+    end
+end)
+
+hook.add("ClientInitialized", "ward13_sync", function(ply)
+    sendSync(ply)
+end)
+
+hook.add("PlayerSay", "ward13_cmd", function(ply, text)
+    if ply ~= owner() or not isstring(text) then return end
+    local msg = string.lower(string.trim(text))
+    local prefix = CONFIG.CHAT_PREFIX
+    if string.sub(msg, 1, #prefix) ~= prefix then return end
+    local arg = string.trim(string.sub(msg, #prefix + 1))
+    if not ready then
+        say("still building.")
+    elseif arg == "reset" then
+        resetRoom()
+        say("the ward is armed again.")
+    elseif arg == "open" then
+        for i = 0, 10 do doorOpen(i, 1.5) end
+        say("every door is open.")
+    elseif arg == "status" then
+        local s = ""
+        for k = 1, 10 do s = s .. k .. ":" .. string.sub(ev[k] or "?", 1, 1) .. " " end
+        say("rooms " .. s .. "| inside: " .. #crowd(1, 10))
+    else
+        say("commands: " .. prefix .. " reset | open | status")
+    end
+end)
+
+for id in pairs(LAMP_DEFAULT) do lampDefault(id) end
+
+local buildTask = spawnTask("build", function()
+    say("building... keep the area in front of the chip clear.")
+    wait(0.3)
+    local ok, err = buildAll()
+    if not ok then
+        say("build failed: " .. tostring(err) .. ". Free up prop/hologram quota (or raise sbox_maxprops) and place the chip again.")
+        return
+    end
+    ready = true
+    resetRoom()
+    sendSync(nil)
+    spawnTask("ambient", ambientDaemon).keep = true
+    if skipped > 0 then
+        say("ready, but " .. skipped .. " decorations were skipped (hologram limit).")
+    else
+        say("ready. Walk in through the left door.")
+    end
+end)
+buildTask.keep = true
+
+end -- SERVER
+
+if CLIENT then
+---------------------------------------------------------------------------
+-- CLIENT: lights, world text, the in-your-face scare, ambience and the HUD
+---------------------------------------------------------------------------
+
+local BOX    = "models/starfall/holograms/box.mdl"
+local SPHERE = "models/starfall/holograms/sphere.mdl"
+
+local me = player()
+local now = timer.curtime()
+local synced, inited = false, false
+local myPos, myK = Vector(0, 0, 0), 0
+local inside = 0                 -- 0..1, eased: how far "in the ward" the local player is
+local tension, tensionShown = 0, 0
+local objectiveText = ""
+local holdT = 0
+
+local lampState = {}
+for id, d in pairs(LAMP_DEFAULT) do
+    lampState[id] = { mode = d[1], r = d[2], g = d[3], b = d[4], level = d[5] }
+end
+local intActive = {}
+local tv = { state = 0, text = "" }
+local flash = { r = 0, g = 0, b = 0, a = 0, t0 = -10, dur = 1 }
+local subtitle = { text = "", t0 = -100, dur = 0 }
+local title = { a = "", b = "", t0 = -100, dur = 0 }
+local scare = { idx = 1, till = 0, hidden = true }
+
+---------------------------------------------------------------------------
+-- Net
+---------------------------------------------------------------------------
+local function readLamp(id)
+    local s = lampState[id]
+    if not s then s = {} lampState[id] = s end
+    s.mode = net.readUInt(4)
+    s.r = net.readUInt(8)
+    s.g = net.readUInt(8)
+    s.b = net.readUInt(8)
+    s.level = net.readUInt(8) / 100
+    s.col = nil
+end
+
+net.receive("hr_sync", function()
+    local x = net.readFloat()
+    local y = net.readFloat()
+    local z = net.readFloat()
+    ORIGIN = Vector(x, y, z)
+    BASE = Angle(0, net.readFloat(), 0)
+    net.readBool()
+    for id = 1, #LAMPS do readLamp(id) end
+    local mask = net.readUInt(16)
+    for id in pairs(INTERACT) do
+        intActive[id] = bit.band(mask, bit.lshift(1, id - 1)) ~= 0
+    end
+    objectiveText = net.readString()
+    tension = net.readUInt(8) / 255
+    tv.state = net.readUInt(2)
+    tv.text = net.readString()
+    synced = true
+end)
+
+net.receive("hr_lamp", function()
+    readLamp(net.readUInt(6))
+end)
+
+net.receive("hr_int", function()
+    local id = net.readUInt(5)
+    intActive[id] = net.readBool()
+end)
+
+net.receive("hr_fx", function()
+    local kind = net.readUInt(5)
+    local t = timer.curtime()
+    if kind == FX.FLASH then
+        flash.r = net.readUInt(8)
+        flash.g = net.readUInt(8)
+        flash.b = net.readUInt(8)
+        flash.a = net.readUInt(8)
+        flash.dur = math.max(net.readFloat(), 0.05)
+        flash.t0 = t
+    elseif kind == FX.SHAKE then
+        local amp = net.readFloat()
+        local freq = net.readFloat()
+        local dur = net.readFloat()
+        pcall(render.screenShake, amp, freq, dur)
+    elseif kind == FX.SUB then
+        subtitle.text = net.readString()
+        subtitle.dur = net.readFloat()
+        subtitle.t0 = t
+    elseif kind == FX.OBJ then
+        objectiveText = net.readString()
+    elseif kind == FX.SCARE then
+        scare.idx = net.readUInt(4)
+        scare.till = t + net.readFloat()
+    elseif kind == FX.TENSION then
+        tension = net.readUInt(8) / 255
+    elseif kind == FX.TITLE then
+        title.a = net.readString()
+        title.b = net.readString()
+        title.dur = net.readFloat()
+        title.t0 = t
+    elseif kind == FX.TV then
+        tv.state = net.readUInt(2)
+        tv.text = net.readString()
+    end
+end)
+
+---------------------------------------------------------------------------
+-- Lamps: a projected light (real falloff and shadows), a dynamic light and a bulb
+---------------------------------------------------------------------------
+local PT_GAIN, DL_GAIN = 3.0, 1.3
+local lampFx = {}
+
+local function lampValue(id, t)
+    local s = lampState[id]
+    if not s or s.mode == MODE.OFF then return 0 end
+    local pat = PATTERN[s.mode] or "m"
+    local n = #pat
+    if n == 1 then return (string.byte(pat) - 97) / 12 end
+    local x = t * 10 + lampFx[id].phase
+    local i = math.floor(x)
+    local a = (string.byte(pat, i % n + 1) - 97) / 12
+    if SMOOTH[s.mode] then
+        local b = (string.byte(pat, (i + 1) % n + 1) - 97) / 12
+        return a + (b - a) * (x - i)
+    end
+    return a
+end
+
+-- Only the rooms next to the player are lit, which keeps the projected-light count tiny.
+local function lampActive(L)
+    if myK == 0 then
+        return (L.chamber == 1 or L.chamber == 10) and myPos.x > -900 and myPos.x < 420 and math.abs(myPos.y) < 900
+    end
+    return math.abs(L.chamber - myK) <= 1
+end
+
+local function initLamps()
+    for id, L in ipairs(LAMPS) do
+        local f = { phase = math.random(0, 40), wpos = toWorld(L.pos), v = -1, bv = -1 }
+        lampFx[id] = f
+        if id <= 10 then
+            local ok, h = pcall(hologram.create, f.wpos, Angle(), SPHERE, Vector(7, 7, 7))
+            if ok and h then
+                f.bulb = h
+                pcall(h.setMaterial, h, "debug/debugdrawflat")
+                pcall(h.suppressEngineLighting, h, true)
+                h:setColor(Color(0, 0, 0))
+            end
+            -- the cord it hangs from
+            local cp = toWorld(L.pos + Vector(0, 0, 9))
+            local ok2, c = pcall(hologram.create, cp, Angle(), BOX, Vector(0.7, 0.7, 11))
+            if ok2 and c then c:setColor(Color(12, 12, 12)) end
+        end
+    end
+end
+
+local function lampColor(s)
+    if not s.col then s.col = Color(s.r, s.g, s.b) end
+    return s.col
+end
+
+local function updateLamps()
+    for id, L in ipairs(LAMPS) do
+        local f, s = lampFx[id], lampState[id]
+        local v = lampValue(id, now) * s.level * CONFIG.LAMP_BRIGHTNESS
+        local act = lampActive(L)
+        local col = lampColor(s)
+
+        if L.proj then
+            local want = act and s.mode ~= MODE.OFF
+            if want and not f.pt and now >= (f.retry or 0) then
+                local ok, pt = pcall(light.createProjected)
+                if ok and pt then
+                    f.pt, f.v, f.shadow, f.ptCol = pt, -1, nil, nil
+                    pt:setTexture("effects/flashlight/soft")
+                    pt:setPos(f.wpos)
+                    pt:setAngles(Angle(90, BASE.y, 0))
+                    pt:setFOV(L.fov)
+                    pt:setNearZ(6)
+                    pt:setFarZ(L.far)
+                else
+                    f.retry = now + 5
+                end
+            elseif not want and f.pt then
+                pcall(f.pt.remove, f.pt)
+                f.pt = nil
+            end
+            local pt = f.pt
+            if pt then
+                local dirty = false
+                local shadow = CONFIG.LAMP_SHADOWS and id <= 10 and L.chamber == myK
+                if shadow ~= f.shadow then
+                    f.shadow = shadow
+                    pt:setEnableShadows(shadow)
+                    dirty = true
+                end
+                if L.spin then
+                    pt:setAngles(Angle(18, BASE.y + now * L.spin, 0))
+                    dirty = true
+                end
+                if v ~= f.v then
+                    f.v = v
+                    pt:setBrightness(v * PT_GAIN)
+                    dirty = true
+                end
+                if f.ptCol ~= col then
+                    f.ptCol = col
+                    pt:setColor(col)
+                    dirty = true
+                end
+                if dirty then pt:update() end
+            end
+        end
+
+        if act and v > 0.02 then
+            if not f.dl then
+                local ok, dl = pcall(light.create, f.wpos, L.size, v * DL_GAIN, col)
+                if ok and dl then f.dl = dl end
+            end
+            if f.dl then
+                f.dl:setBrightness(v * DL_GAIN)
+                f.dl:setColor(col)
+                pcall(f.dl.draw, f.dl)
+            end
+        end
+
+        if f.bulb and math.abs(v - f.bv) > 0.03 then
+            f.bv = v
+            local m = clamp(v, 0, 1)
+            f.bulb:setColor(Color(s.r * m, s.g * m, s.b * m))
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- World text: one render target each for the wall writing, the USE prompt and the TV
+---------------------------------------------------------------------------
+local text = { ok = false, writeIdx = -1, promptLabel = "", refresh = 0, tvAt = 0 }
+
+local function initText()
+    local function panel(rt, size)
+        render.createRenderTarget(rt)
+        local m = material.create("UnlitGeneric")
+        m:setTextureRenderTarget("$basetexture", rt)
+        m:setInt("$flags", 128)         -- $additive: the black background adds nothing, the text glows faintly
+        local h = hologram.create(chip():getPos(), Angle(), BOX, Vector(0.4, size, size))
+        h:setMaterial("!" .. m:getName())
+        pcall(h.setRenderGroup, h, RENDERGROUP.TRANSLUCENT)   -- additive panels must draw after the wall behind them
+        h:setNoDraw(true)
+        return h
+    end
+    text.write  = panel("ward13_write", 160)
+    text.prompt = panel("ward13_prompt", 60)
+    text.tv     = panel("ward13_tv", 26)
+    text.fWrite  = render.createFont("Akbar", 170, 700, true)
+    text.fWriteS = render.createFont("Akbar", 118, 700, true)
+    text.fKey    = render.createFont("Roboto", 120, 900, true)
+    text.fLabel  = render.createFont("Roboto", 70, 700, true)
+    text.fTV     = render.createFont("Roboto", 150, 900, true)
+    local wp, wa = toWorld(SPOT.tvScreen, Angle(0, 180, 0))
+    text.tv:setPos(wp)
+    text.tv:setAngles(wa)
+    text.tv:setNoDraw(false)
+    text.ok = true
+end
+
+local function drawWriting(w, seed)
+    render.clear(Color(0, 0, 0, 255))
+    local n = #w.lines
+    local lh = 185
+    local y0 = 512 - (n - 1) * lh / 2
+    local bottom = y0
+    for i, line in ipairs(w.lines) do
+        render.setFont(text.fWrite)
+        if render.getTextSize(line) > 960 then render.setFont(text.fWriteS) end
+        local y = y0 + (i - 1) * lh
+        render.setColor(Color(w.col[1] * 0.45, w.col[2] * 0.45, w.col[3] * 0.45))
+        render.drawSimpleText(518, y + 7, line, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+        render.setColor(Color(w.col[1], w.col[2], w.col[3]))
+        render.drawSimpleText(512, y, line, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+        bottom = y
+    end
+    -- runs of paint under the letters
+    for i = 1, 12 do
+        local x = 170 + (i * 197 + seed * 53) % 690
+        local len = 30 + (i * 61 + seed * 17) % 190
+        render.setColor(Color(w.col[1] * 0.8, w.col[2] * 0.8, w.col[3] * 0.8))
+        render.drawRect(x, bottom + 34, 4 + i % 3, len)
+    end
+end
+
+local function drawPrompt()
+    render.clear(Color(0, 0, 0, 255))
+    local label = text.promptLabel
+    if label == "" then return end
+    local hold = text.promptHold
+    render.setFont(text.fKey)
+    render.setColor(Color(235, 235, 225))
+    render.drawSimpleText(512, 400, hold and "[ HOLD E ]" or "[ E ]", TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+    render.setFont(text.fLabel)
+    render.setColor(Color(200, 200, 190))
+    render.drawSimpleText(512, 520, label, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+    if hold and holdT > 0 then
+        local f = clamp(holdT / hold, 0, 1)
+        render.setColor(Color(70, 70, 70))
+        render.drawRect(212, 600, 600, 26)
+        render.setColor(Color(200, 30, 30))
+        render.drawRect(212, 600, 600 * f, 26)
+    end
+end
+
+local function drawTV()
+    render.clear(Color(0, 0, 0, 255))
+    if tv.state == 0 then return end
+    for i = 1, 80 do
+        local g = math.random(20, 150)
+        render.setColor(Color(g, g, g + 12))
+        render.drawRect(math.random(-100, 1024), math.random(0, 1024), math.random(20, 260), math.random(3, 14))
+    end
+    render.setColor(Color(120, 130, 140))
+    render.drawRect(0, (now * 380) % 1024, 1024, 40)
+    if tv.state == 2 and (now * 2.2) % 1 < 0.72 then
+        local a, b = string.match(tv.text, "^(.-)%s+(%S+)$")
+        if not a then a, b = tv.text, "" end
+        render.setFont(text.fTV)
+        render.setColor(Color(255, 255, 255))
+        render.drawSimpleText(512 + math.random(-10, 10), 420, a, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+        render.drawSimpleText(512 + math.random(-10, 10), 610, b, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+    end
+end
+
+local function updateText(ft)
+    if not text.ok then return end
+    -- wall writing follows the room the player is in
+    if myK ~= text.writeIdx then
+        text.writeIdx = myK
+        local w = WRITINGS[myK]
+        if w then
+            local wp, wa = toWorld(w.pos, Angle(0, w.yaw, 0))
+            text.write:setPos(wp)
+            text.write:setAngles(wa)
+            text.write:setScale(Vector(0.4, w.size, w.size))
+            text.write:setNoDraw(false)
+            text.writeDirty = true
+        else
+            text.write:setNoDraw(true)
+        end
+    end
+
+    -- the prompt hovers over the nearest thing that can be used, facing the player
+    local best, bestD
+    local eye = eyePos()
+    if myK > 0 then
+        local leye = toLocal(eye)
+        for id, def in pairs(INTERACT) do
+            if intActive[id] then
+                local d = leye:getDistance(def.pos)
+                if d < def.radius * 2.2 and (not bestD or d < bestD) then best, bestD = id, d end
+            end
+        end
+    end
+    if best then
+        local def = INTERACT[best]
+        if text.promptLabel ~= def.label then
+            text.promptLabel, text.promptHold = def.label, def.hold
+            text.promptDirty = true
+        end
+        local wp = toWorld(def.pos + Vector(0, 0, 22))
+        local dir = eye - wp
+        text.prompt:setPos(wp)
+        text.prompt:setAngles(Angle(0, dir:getAngle().y, 0))
+        if text.promptHidden ~= false then
+            text.promptHidden = false
+            text.prompt:setNoDraw(false)
+        end
+        if def.hold and bestD < def.radius and me:keyDown(IN_KEY.USE) then
+            holdT = holdT + ft
+            text.promptDirty = true
+        elseif holdT > 0 then
+            holdT = 0
+            text.promptDirty = true
+        end
+    else
+        holdT = 0
+        if text.promptHidden ~= true then
+            text.promptHidden = true
+            text.prompt:setNoDraw(true)
+        end
+    end
+
+    -- render targets can be lost; repaint the static ones now and then
+    if now >= text.refresh then
+        text.refresh = now + 4
+        text.writeDirty = true
+        text.promptDirty = true
+    end
+end
+
+hook.add("renderoffscreen", "ward13_rt", function()
+    if not text.ok then return end
+    if text.writeDirty then
+        text.writeDirty = false
+        local w = WRITINGS[text.writeIdx]
+        if w then
+            render.selectRenderTarget("ward13_write")
+            drawWriting(w, text.writeIdx)
+            render.selectRenderTarget()
+        end
+    end
+    if text.promptDirty then
+        text.promptDirty = false
+        render.selectRenderTarget("ward13_prompt")
+        drawPrompt()
+        render.selectRenderTarget()
+    end
+    if (tv.state > 0 or tv.shown ~= tv.state) and now >= text.tvAt and math.abs(myK - 2) <= 1 then
+        text.tvAt = now + 0.045
+        tv.shown = tv.state
+        render.selectRenderTarget("ward13_tv")
+        drawTV()
+        render.selectRenderTarget()
+    end
+end)
+
+---------------------------------------------------------------------------
+-- The scare: a body pinned to the camera for a fraction of a second
+---------------------------------------------------------------------------
+local function updateScare()
+    if now < scare.till then
+        local def = SCARE[scare.idx] or SCARE[1]
+        if not scare.holo then
+            local ok, h = pcall(hologram.create, eyePos(), Angle(), def.model, Vector(1, 1, 1))
+            if ok and h then scare.holo, scare.model = h, def.model end
+        elseif scare.model ~= def.model then
+            pcall(scare.holo.setModel, scare.holo, def.model)
+            scare.model = def.model
+        end
+        local ep, ea = eyePos(), eyeAngles()
+        local fwd = ea:getForward()
+        local h = scare.holo
+        if h then
+            local ang = Angle(math.rand(-4, 4), ea.y + 180 + math.rand(-5, 5), math.rand(-6, 6))
+            local head = localToWorld(def.head, ANG0, VEC0, ang)
+            h:setPos(ep + fwd * (20 + math.rand(-2, 2)) - head)
+            h:setAngles(ang)
+            if scare.hidden then
+                scare.hidden = false
+                h:setNoDraw(false)
+            end
+        end
+        -- a hard light so the face is the brightest thing on screen
+        if not scare.dl then
+            local ok, dl = pcall(light.create, ep, 220, 4, Color(255, 235, 220))
+            if ok and dl then scare.dl = dl end
+        end
+        if scare.dl then
+            scare.dl:setPos(ep + fwd * 4)
+            scare.dl:setBrightness(math.random(2, 5))
+            pcall(scare.dl.draw, scare.dl)
+        end
+    elseif scare.holo and not scare.hidden then
+        scare.hidden = true
+        scare.holo:setNoDraw(true)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Ambience that follows the player: a low drone and a heartbeat
+---------------------------------------------------------------------------
+local amb = { at = 0 }
+
+local function initSounds()
+    local ok, s = pcall(sound.create, me, "ambient/atmosphere/drone4lp.wav")
+    if ok and s then amb.bed = s end
+    local ok2, s2 = pcall(sound.create, me, "player/heartbeat1.wav")
+    if ok2 and s2 then amb.heart = s2 end
+end
+
+local function fade(s, key, want, vol, pitch)
+    if not s then return end
+    if want then
+        if not amb[key] or not s:isPlaying() then
+            amb[key] = true
+            s:play()
+        end
+        s:setVolume(clamp(vol * CONFIG.VOLUME, 0, 1))
+        if pitch then s:setPitch(pitch) end
+    elseif amb[key] then
+        amb[key] = false
+        s:stop(0.5)
+    end
+end
+
+local function updateSounds()
+    if now < amb.at then return end
+    amb.at = now + 0.1
+    fade(amb.bed, "bedOn", inside > 0.02, inside * 0.55)
+    local beat = clamp((tensionShown - 0.4) * 1.7, 0, 1)
+    fade(amb.heart, "heartOn", inside > 0.5 and beat > 0.02, beat, 88 + tensionShown * 40)
+end
+
+---------------------------------------------------------------------------
+-- HUD (only for players with the Starfall HUD enabled)
+---------------------------------------------------------------------------
+local hud = {}
+
+local function initHud()
+    hud.fSub    = render.createFont("Roboto", 30, 500, true)
+    hud.fObj    = render.createFont("Roboto", 21, 700, true)
+    hud.fTitle  = render.createFont("Akbar", 120, 700, true)
+    hud.fTitle2 = render.createFont("Roboto", 34, 400, true)
+    for _, d in ipairs({ "l", "r", "u", "d" }) do
+        local ok, m = pcall(material.load, "vgui/gradient-" .. d)
+        if ok and m then hud[d] = m end
+    end
+end
+
+local function vignette(w, h, col, frac)
+    render.setColor(col)
+    if hud.l then render.setMaterial(hud.l) render.drawTexturedRect(0, 0, w * frac, h) end
+    if hud.r then render.setMaterial(hud.r) render.drawTexturedRect(w * (1 - frac), 0, w * frac, h) end
+    if hud.u then render.setMaterial(hud.u) render.drawTexturedRect(0, 0, w, h * frac) end
+    if hud.d then render.setMaterial(hud.d) render.drawTexturedRect(0, h * (1 - frac), w, h * frac) end
+    render.setMaterial()
+end
+
+local function shadowText(x, y, str, col, alpha)
+    render.setColor(Color(0, 0, 0, alpha))
+    render.drawSimpleText(x + 2, y + 2, str, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+    render.setColor(Color(col[1], col[2], col[3], alpha))
+    render.drawSimpleText(x, y, str, TEXT_ALIGN.CENTER, TEXT_ALIGN.CENTER)
+end
+
+-- alpha envelope: quick in, slow out
+local function envelope(t, dur, fin, fout)
+    if t < 0 or t > dur then return 0 end
+    return clamp(math.min(t / fin, (dur - t) / fout), 0, 1)
+end
+
+hook.add("drawhud", "ward13_hud", function()
+    if not synced or not hud.fSub then return end
+    local w, h = render.getResolution()
+    local a = inside
+
+    if a > 0.01 then
+        render.setColor(Color(0, 0, 0, 255 * CONFIG.HUD_DARKNESS * a))
+        render.drawRect(0, 0, w, h)
+        vignette(w, h, Color(0, 0, 0, clamp(175 + tensionShown * 70, 0, 255) * a), 0.34)
+        if tensionShown > 0.5 then
+            local pulse = (math.sin(now * (4 + tensionShown * 5)) * 0.5 + 0.5) * (tensionShown - 0.5) * 2
+            vignette(w, h, Color(120, 0, 0, 110 * pulse * a), 0.2)
+        end
+        if CONFIG.FILM_GRAIN then
+            for i = 1, 44 do
+                local g = math.random(0, 1) * 255
+                render.setColor(Color(g, g, g, math.random(6, 22) * a))
+                render.drawRectFast(math.random(0, w), math.random(0, h), math.random(1, 3), math.random(1, 3))
+            end
+            if math.random(1, 40) == 1 then
+                render.setColor(Color(255, 255, 255, 14 * a))
+                render.drawRectFast(math.random(0, w), 0, 1, h)
+            end
+        end
+    end
+
+    local ft = (now - flash.t0) / flash.dur
+    if ft >= 0 and ft < 1 then
+        render.setColor(Color(flash.r, flash.g, flash.b, flash.a * (1 - ft)))
+        render.drawRect(0, 0, w, h)
+    end
+    if now < scare.till then
+        vignette(w, h, Color(150, 0, 0, 210), 0.3)
+    end
+
+    if objectiveText ~= "" and a > 0.3 then
+        render.setFont(hud.fObj)
+        shadowText(w / 2, h * 0.06, string.upper(objectiveText), { 200, 195, 180 }, 200 * a)
+    end
+
+    local sa = envelope(now - subtitle.t0, subtitle.dur, 0.35, 0.8)
+    if sa > 0 then
+        render.setFont(hud.fSub)
+        -- typed out, a few letters per frame
+        local shown = string.sub(subtitle.text, 1, math.floor((now - subtitle.t0) * 45) + 1)
+        shadowText(w / 2, h * 0.84, shown, { 225, 220, 205 }, 255 * sa)
+    end
+
+    local ta = envelope(now - title.t0, title.dur, 0.25, 1.2)
+    if ta > 0 then
+        render.setFont(hud.fTitle)
+        shadowText(w / 2, h * 0.42, title.a, { 190, 20, 20 }, 255 * ta)
+        if title.b ~= "" then
+            render.setFont(hud.fTitle2)
+            shadowText(w / 2, h * 0.42 + 90, title.b, { 220, 215, 200 }, 255 * ta)
+        end
+    end
+end)
+
+local fogOn = false
+local function updateFog()
+    local want = CONFIG.FOG and inside > 0.05
+    if want == fogOn then return end
+    fogOn = want
+    if want then
+        hook.add("setupworldfog", "ward13_fog", function()
+            render.setFogStart(40)
+            render.setFogEnd(780)
+            render.setFogDensity(0.86 * inside)
+            render.setFogColor(Color(3, 3, 5))
+        end)
+    else
+        hook.remove("setupworldfog", "ward13_fog")
+    end
+end
+
+-- The owner gets the HUD straight away; everyone else can accept the request (USE on the chip)
+-- or press USE on the terminal by the entrance.
+pcall(setupPermissionRequest, { "enablehud" },
+    "WARD 13 would like to draw its screen effects: darkness, fog, film grain, camera shake and subtitles.", true)
+
+local function tryHud()
+    if me == owner() and not CONFIG.OWNER_AUTO_HUD then return end
+    local ok, allowed = pcall(hasPermission, "enablehud")
+    if ok and allowed then pcall(enableHud, nil, true) end
+end
+
+hook.add("permissionrequest", "ward13_perm", function()
+    local ok, yes = pcall(permissionRequestSatisfied)
+    if ok and yes then pcall(enableHud, nil, true) end
+end)
+
+---------------------------------------------------------------------------
+-- Main loop
+---------------------------------------------------------------------------
+local broken = {}
+
+-- One failing subsystem (a refused permission, a hit limit) must not take the rest down.
+local function guard(name, fn, arg)
+    if broken[name] then return end
+    local ok, err = pcall(fn, arg)
+    if not ok then
+        broken[name] = true
+        pcall(print, "[WARD 13] " .. name .. " disabled: " .. tostring(err))
+    end
+end
+
+hook.add("think", "ward13_client", function()
+    local t = timer.curtime()
+    local ft = clamp(t - now, 0, 0.1)
+    now = t
+    if not synced then return end
+    if not inited then
+        inited = true
+        guard("lamps", initLamps)
+        guard("text", initText)
+        guard("sounds", initSounds)
+        guard("hud", initHud)
+        tryHud()
+    end
+
+    myPos = toLocal(me:getPos())
+    myK = chamberAt(myPos)
+    inside = inside + clamp((myK > 0 and 1 or 0) - inside, -ft * 1.2, ft * 1.6)
+    tensionShown = tensionShown + clamp(tension - tensionShown, -ft * 0.5, ft * 1.5)
+
+    guard("lamps", updateLamps)
+    guard("text", updateText, ft)
+    guard("scare", updateScare)
+    guard("sounds", updateSounds)
+    guard("fog", updateFog)
+end)
+
+end -- CLIENT
